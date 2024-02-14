@@ -1,0 +1,23 @@
+version: "3.8"
+
+services:
+  llmcord:
+    build: .
+    container_name: llmcord
+    restart: unless-stopped
+    ports:
+      - "5001:5000" # set your mapping as you wish
+    logging:
+      options:
+        max-size: "10m"
+    environment:
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - LLM=${LLM}
+      - CUSTOM_SYSTEM_PROMPT=${CUSTOM_SYSTEM_PROMPT}
+      - ALLOWED_CHANNEL_IDS=${ALLOWED_CHANNEL_IDS}
+      - ALLOWED_ROLE_IDS=${ALLOWED_ROLE_IDS}
+      - MAX_IMAGES=${MAX_IMAGES}
+      - MAX_MESSAGES=${MAX_MESSAGES}
+      - LOCAL_SERVER_URL=${LOCAL_SERVER_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
