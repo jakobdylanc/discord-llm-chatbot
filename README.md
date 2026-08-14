@@ -116,10 +116,10 @@ Or run local models with:
 
 ## Star History
 
-<a href="https://star-history.com/#jakobdylanc/llmcord&Date">
+<a href="https://star-history.dera.page/#jakobdylanc/llmcord&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=jakobdylanc/llmcord&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=jakobdylanc/llmcord&type=Date" />
-    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=jakobdylanc/llmcord&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=jakobdylanc/llmcord&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=jakobdylanc/llmcord&type=Date" />
+    <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=jakobdylanc/llmcord&type=Date" />
   </picture>
 </a>
