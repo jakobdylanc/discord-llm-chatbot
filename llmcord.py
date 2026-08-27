@@ -550,21 +550,51 @@ async def _apply_memory(
                 logging.exception("WDBX memory write failed")
 
 
-@discord_bot.event
-async def on_message(new_msg: discord.Message) -> None:
-    global last_task_time, config, curr_model
+@dataclass(frozen=True)
+class Gate:
+    """The policy verdict for one incoming message.
+
+    `proceed` is the only thing on_message has to branch on; everything the reward
+    bookkeeping needs later rides along rather than being recomputed.
+    """
+
+    proceed: bool
+    guild_id: str = "dm"
+    state: list[float] | None = None
+    should_learn: bool = False
+
+
+STOP = Gate(proceed=False)
+
+
+async def _gate(new_msg: discord.Message) -> Gate:
+    """Decide whether this message earns a reply, applying any non-reply policy action.
+
+    Returns STOP for every path that must not reach a provider: bot authors, a config
+    that no longer validates, denied permissions, and the ignore/stay/react verdicts.
+    Mentions and DMs are forced through and bypass cooldown and budget.
+    """
+    global config, curr_model
 
     if new_msg.author.bot:
-        return
+        return STOP
 
-    if learning_store is not None and new_msg.reference is not None and new_msg.reference.message_id:
-        learning_store.note_human_reply(str(new_msg.reference.message_id))
+    store = learning_store
+    if store is not None and new_msg.reference is not None and new_msg.reference.message_id:
+        store.note_human_reply(str(new_msg.reference.message_id))
 
     is_dm = new_msg.channel.type == discord.ChannelType.private
     mentioned = bool(discord_bot.user and discord_bot.user in new_msg.mentions)
     forced = is_dm or mentioned
 
-    role_ids = set(role.id for role in getattr(new_msg.author, "roles", ()))
+    try:
+        config = await asyncio.to_thread(load_and_validate, config_filename)
+        if curr_model not in config["models"]:
+            curr_model = default_model(config["models"])
+    except (OSError, ConfigError):
+        logging.exception("Failed to reload config.yaml")
+        return STOP
+
     channel_ids = set(
         filter(
             None,
@@ -575,86 +605,71 @@ async def on_message(new_msg: discord.Message) -> None:
             ),
         )
     )
-
-    try:
-        config = await asyncio.to_thread(load_and_validate, config_filename)
-        if curr_model not in config["models"]:
-            curr_model = default_model(config["models"])
-    except (OSError, ConfigError):
-        logging.exception("Failed to reload config.yaml")
-        return
-
-    allow_dms = config.get("allow_dms", True)
-    permissions = config["permissions"]
-
     if not is_message_allowed(
         user_id=new_msg.author.id,
-        role_ids=role_ids,
+        role_ids={role.id for role in getattr(new_msg.author, "roles", ())},
         channel_ids=channel_ids,
         is_dm=is_dm,
-        allow_dms=allow_dms,
-        permissions=permissions,
+        allow_dms=config.get("allow_dms", True),
+        permissions=config["permissions"],
     ):
-        return
+        return STOP
 
     guild_id = str(new_msg.guild.id) if new_msg.guild else "dm"
-    state: list[float] | None = None
-    should_learn = False
+    if store is None:
+        return Gate(proceed=True, guild_id=guild_id) if forced else STOP
 
-    if learning_store is not None:
-        learning_store.note_channel_message(str(new_msg.channel.id))
-        has_image = any(att.content_type and att.content_type.startswith("image") for att in new_msg.attachments)
-        state = encode_state(
-            text=new_msg.content,
-            reputation=learning_store.reputation(guild_id, str(new_msg.author.id)),
-            mentions_bot=mentioned,
-            has_image=has_image,
-            hour=datetime.now().astimezone().hour,
-            channel_heat=learning_store.channel_heat(str(new_msg.channel.id)),
-        )
-        captured_state = state
+    store.note_channel_message(str(new_msg.channel.id))
+    state = encode_state(
+        text=new_msg.content,
+        reputation=store.reputation(guild_id, str(new_msg.author.id)),
+        mentions_bot=mentioned,
+        has_image=any(att.content_type and att.content_type.startswith("image") for att in new_msg.attachments),
+        hour=datetime.now().astimezone().hour,
+        channel_heat=store.channel_heat(str(new_msg.channel.id)),
+    )
+    decision = decide_action(
+        forced=forced,
+        learning=store.is_learning(guild_id),
+        act=store.is_act(guild_id),
+        cooldown_ok=forced or store.cooldown_ok(str(new_msg.channel.id), guild_id),
+        budget_ok=forced or store.budget_ok(guild_id),
+        select=lambda: store.brain(guild_id).select_action(state),
+    )
+    logging.info("policy guild=%s kind=%s reason=%s forced=%s", guild_id, decision.kind, decision.reason, forced)
 
-        def _select() -> int:
-            assert learning_store is not None
-            return learning_store.brain(guild_id).select_action(captured_state)
+    def _spend() -> None:
+        if not forced:
+            store.spend_budget(guild_id)
+            store.mark_unsolicited(str(new_msg.channel.id))
 
-        decision = decide_action(
-            forced=forced,
-            learning=learning_store.is_learning(guild_id),
-            act=learning_store.is_act(guild_id),
-            cooldown_ok=forced or learning_store.cooldown_ok(str(new_msg.channel.id), guild_id),
-            budget_ok=forced or learning_store.budget_ok(guild_id),
-            select=_select,
-        )
-        should_learn = decision.learn
-        logging.info("policy guild=%s kind=%s reason=%s forced=%s", guild_id, decision.kind, decision.reason, forced)
-        if decision.kind == "ignore":
-            return
-        if decision.kind == "stay":
-            learning_store.remember_stay(guild_id, state)
-            return
-        if decision.kind == "react":
-            if not forced:
-                learning_store.spend_budget(guild_id)
-                learning_store.mark_unsolicited(str(new_msg.channel.id))
-            emoji = (config.get("learning") or {}).get("react_emoji") or "👍"
-            try:
-                await new_msg.add_reaction(emoji)
-            except discord.HTTPException:
-                logging.exception("Failed to add reaction")
-            if should_learn:
-                learning_store.open_pending(
-                    guild_id=guild_id,
-                    message_id=str(new_msg.id),
-                    action=Action.REACT,
-                    state=state,
-                )
-            return
-        if decision.kind == "reply" and not forced:
-            learning_store.spend_budget(guild_id)
-            learning_store.mark_unsolicited(str(new_msg.channel.id))
-    elif not forced:
+    if decision.kind == "ignore":
+        return STOP
+    if decision.kind == "stay":
+        store.remember_stay(guild_id, state)
+        return STOP
+    if decision.kind == "react":
+        _spend()
+        try:
+            await new_msg.add_reaction((config.get("learning") or {}).get("react_emoji") or "\N{THUMBS UP SIGN}")
+        except discord.HTTPException:
+            logging.exception("Failed to add reaction")
+        if decision.learn:
+            store.open_pending(guild_id=guild_id, message_id=str(new_msg.id), action=Action.REACT, state=state)
+        return STOP
+    if decision.kind == "reply":
+        _spend()
+    return Gate(proceed=True, guild_id=guild_id, state=state, should_learn=decision.learn)
+
+
+@discord_bot.event
+async def on_message(new_msg: discord.Message) -> None:
+    global last_task_time
+
+    gate = await _gate(new_msg)
+    if not gate.proceed:
         return
+    guild_id, state, should_learn = gate.guild_id, gate.state, gate.should_learn
 
     provider_slash_model = curr_model
     try:
