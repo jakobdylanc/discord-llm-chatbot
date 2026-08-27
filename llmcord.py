@@ -549,6 +549,7 @@ async def _apply_memory(
             except Exception:
                 logging.exception("WDBX memory write failed")
 
+
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
     global last_task_time, config, curr_model
