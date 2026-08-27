@@ -52,6 +52,9 @@ EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
 
+# The ABI router returns one bounded string; chunk it to the shape the stream loop wants.
+ABI_CHUNK_CHARS = 1_000
+
 config: dict[str, Any] = {}
 config_filename = "config.yaml"
 curr_model = ""
@@ -343,6 +346,209 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
     learning_store.settle_due()
 
 
+
+
+async def _completion_chunks(
+    *,
+    provider_backend: str,
+    provider_config: dict[str, Any],
+    openai_client: AsyncOpenAI | None,
+    openai_kwargs: dict[str, Any],
+    user_text: str,
+    model: str,
+):
+    """Yield `(text, finish_reason)` pairs from whichever provider backend is selected.
+
+    The ABI MCP router returns one bounded string rather than a stream, so it is chunked
+    to the same shape the streaming loop already consumes.
+    """
+    if provider_backend == "abi-mcp":
+        abi = AbiMcpBackend(
+            _backend_httpx_client(),
+            base_url=provider_config["base_url"],
+            token=provider_config.get("token"),
+            tool=provider_config.get("tool", "ai_run"),
+            evidence_limit=int(provider_config.get("evidence_limit", 5)),
+            timeout_seconds=float(provider_config.get("timeout_seconds", 30)),
+        )
+        text = await abi.complete(user_text, model)
+        for start in range(0, len(text), ABI_CHUNK_CHARS):
+            end = min(start + ABI_CHUNK_CHARS, len(text))
+            yield text[start:end], "stop" if end == len(text) else None
+        return
+
+    if openai_client is None:
+        raise ConfigError(f"provider backend {provider_backend!r} has no OpenAI client")
+    async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
+        choice = chunk.choices[0] if chunk.choices else None
+        if choice is not None:
+            yield choice.delta.content or "", choice.finish_reason
+
+
+async def _build_conversation(
+    new_msg: discord.Message, *, max_text: int, max_images: int, max_messages: int
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Walk the reply chain newest-first into OpenAI-shaped messages plus user warnings."""
+    messages = []
+    user_warnings = set()
+    curr_msg = new_msg
+
+    while curr_msg is not None and len(messages) < max_messages:
+        curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
+
+        async with curr_node.lock:
+            if curr_node.text is None:
+                cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
+
+                good_attachments = [
+                    att
+                    for att in curr_msg.attachments
+                    if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))
+                ]
+
+                attachment_responses = await asyncio.gather(*[_httpx_client().get(att.url) for att in good_attachments])
+
+                curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
+
+                curr_node.text = "\n".join(
+                    ([cleaned_content] if cleaned_content else [])
+                    + [
+                        "\n".join(filter(None, (embed.title, embed.description, embed.footer.text)))
+                        for embed in curr_msg.embeds
+                    ]
+                    + [
+                        component.content
+                        for component in curr_msg.components
+                        if component.type == discord.ComponentType.text_display
+                    ]
+                    + [
+                        resp.text
+                        for att, resp in zip(good_attachments, attachment_responses, strict=True)
+                        if att.content_type.startswith("text")
+                    ]
+                )
+
+                curr_node.images = [
+                    dict(
+                        type="image_url",
+                        image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"),
+                    )
+                    for att, resp in zip(good_attachments, attachment_responses, strict=True)
+                    if att.content_type.startswith("image")
+                ]
+
+                if curr_node.role == "user" and (curr_node.text or curr_node.images):
+                    curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
+
+                curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
+
+                try:
+                    if (
+                        curr_msg.reference is None
+                        and discord_bot.user.mention not in curr_msg.content
+                        and (
+                            prev_msg_in_channel := (
+                                [m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None]
+                            )[0]
+                        )
+                        and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
+                        and prev_msg_in_channel.author
+                        == (
+                            discord_bot.user
+                            if curr_msg.channel.type == discord.ChannelType.private
+                            else curr_msg.author
+                        )
+                    ):
+                        curr_node.parent_msg = prev_msg_in_channel
+                    else:
+                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
+                        parent_is_thread_start = (
+                            is_public_thread
+                            and curr_msg.reference is None
+                            and curr_msg.channel.parent.type == discord.ChannelType.text
+                        )
+
+                        if (
+                            parent_msg_id := curr_msg.channel.id
+                            if parent_is_thread_start
+                            else getattr(curr_msg.reference, "message_id", None)
+                        ):
+                            if parent_is_thread_start:
+                                curr_node.parent_msg = (
+                                    curr_msg.channel.starter_message
+                                    or await curr_msg.channel.parent.fetch_message(parent_msg_id)
+                                )
+                            else:
+                                curr_node.parent_msg = (
+                                    curr_msg.reference.cached_message
+                                    or await curr_msg.channel.fetch_message(parent_msg_id)
+                                )
+
+                except (discord.NotFound, discord.HTTPException):
+                    logging.exception("Error fetching next message in the chain")
+                    curr_node.fetch_parent_failed = True
+
+            node_text = curr_node.text or ""
+            if curr_node.images[:max_images]:
+                content = [dict(type="text", text=node_text[:max_text])] + curr_node.images[:max_images]
+            else:
+                content = node_text[:max_text]
+
+            if content != "":
+                messages.append(dict(content=content, role=curr_node.role))
+
+            if len(node_text) > max_text:
+                user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
+            if len(curr_node.images) > max_images:
+                user_warnings.add(
+                    f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message"
+                    if max_images > 0
+                    else "⚠️ Can't see images"
+                )
+            if curr_node.has_bad_attachments:
+                user_warnings.add("⚠️ Unsupported attachments")
+            if curr_node.fetch_parent_failed or (curr_node.parent_msg is not None and len(messages) == max_messages):
+                user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
+
+            curr_msg = curr_node.parent_msg
+
+    return messages, user_warnings
+
+
+async def _apply_memory(
+    messages: list[dict[str, Any]], new_msg: discord.Message, *, provider_backend: str
+) -> None:
+    """Append recalled WDBX context to `messages` and persist explicit remember requests."""
+    try:
+        memory_backend = _memory_backend(config)
+    except Exception:
+        logging.exception("WDBX memory configuration failed; continuing without durable memory")
+        memory_backend = None
+
+    if memory_backend is not None:
+        # The ABI MCP path deliberately sends only the current user text, so it discards
+        # `messages` entirely. Recalling into a list nobody reads would pay the WDBX
+        # timeout on every message for nothing. Writes still run: an explicit "remember"
+        # must persist regardless of which provider answers.
+        if provider_backend != "abi-mcp":
+            try:
+                memories = await memory_backend.recall(scope=_memory_scope(new_msg), query=new_msg.content)
+                if memory_context := render_memory_context(memories):
+                    messages.append(dict(role="user", content=memory_context))
+            except Exception:
+                logging.exception("WDBX memory recall failed; continuing without recalled memory")
+        if should_store_memory(new_msg.content):
+            try:
+                await memory_backend.remember(
+                    scope=_memory_scope(new_msg),
+                    author_id=str(new_msg.author.id),
+                    role="user",
+                    content=new_msg.content,
+                    message_id=str(new_msg.id),
+                )
+            except Exception:
+                logging.exception("WDBX memory write failed")
+
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
     global last_task_time, config, curr_model
@@ -481,128 +687,9 @@ async def on_message(new_msg: discord.Message) -> None:
     max_images = config.get("max_images", 5) if accept_images else 0
     max_messages = config.get("max_messages", 25)
 
-    messages = []
-    user_warnings = set()
-    curr_msg = new_msg
-
-    while curr_msg is not None and len(messages) < max_messages:
-        curr_node = msg_nodes.setdefault(curr_msg.id, MsgNode())
-
-        async with curr_node.lock:
-            if curr_node.text is None:
-                cleaned_content = curr_msg.content.removeprefix(discord_bot.user.mention).lstrip()
-
-                good_attachments = [
-                    att
-                    for att in curr_msg.attachments
-                    if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))
-                ]
-
-                attachment_responses = await asyncio.gather(*[_httpx_client().get(att.url) for att in good_attachments])
-
-                curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
-
-                curr_node.text = "\n".join(
-                    ([cleaned_content] if cleaned_content else [])
-                    + [
-                        "\n".join(filter(None, (embed.title, embed.description, embed.footer.text)))
-                        for embed in curr_msg.embeds
-                    ]
-                    + [
-                        component.content
-                        for component in curr_msg.components
-                        if component.type == discord.ComponentType.text_display
-                    ]
-                    + [
-                        resp.text
-                        for att, resp in zip(good_attachments, attachment_responses, strict=True)
-                        if att.content_type.startswith("text")
-                    ]
-                )
-
-                curr_node.images = [
-                    dict(
-                        type="image_url",
-                        image_url=dict(url=f"data:{att.content_type};base64,{b64encode(resp.content).decode('utf-8')}"),
-                    )
-                    for att, resp in zip(good_attachments, attachment_responses, strict=True)
-                    if att.content_type.startswith("image")
-                ]
-
-                if curr_node.role == "user" and (curr_node.text or curr_node.images):
-                    curr_node.text = f"<@{curr_msg.author.id}>: {curr_node.text}"
-
-                curr_node.has_bad_attachments = len(curr_msg.attachments) > len(good_attachments)
-
-                try:
-                    if (
-                        curr_msg.reference is None
-                        and discord_bot.user.mention not in curr_msg.content
-                        and (
-                            prev_msg_in_channel := (
-                                [m async for m in curr_msg.channel.history(before=curr_msg, limit=1)] or [None]
-                            )[0]
-                        )
-                        and prev_msg_in_channel.type in (discord.MessageType.default, discord.MessageType.reply)
-                        and prev_msg_in_channel.author
-                        == (
-                            discord_bot.user
-                            if curr_msg.channel.type == discord.ChannelType.private
-                            else curr_msg.author
-                        )
-                    ):
-                        curr_node.parent_msg = prev_msg_in_channel
-                    else:
-                        is_public_thread = curr_msg.channel.type == discord.ChannelType.public_thread
-                        parent_is_thread_start = (
-                            is_public_thread
-                            and curr_msg.reference is None
-                            and curr_msg.channel.parent.type == discord.ChannelType.text
-                        )
-
-                        if (
-                            parent_msg_id := curr_msg.channel.id
-                            if parent_is_thread_start
-                            else getattr(curr_msg.reference, "message_id", None)
-                        ):
-                            if parent_is_thread_start:
-                                curr_node.parent_msg = (
-                                    curr_msg.channel.starter_message
-                                    or await curr_msg.channel.parent.fetch_message(parent_msg_id)
-                                )
-                            else:
-                                curr_node.parent_msg = (
-                                    curr_msg.reference.cached_message
-                                    or await curr_msg.channel.fetch_message(parent_msg_id)
-                                )
-
-                except (discord.NotFound, discord.HTTPException):
-                    logging.exception("Error fetching next message in the chain")
-                    curr_node.fetch_parent_failed = True
-
-            node_text = curr_node.text or ""
-            if curr_node.images[:max_images]:
-                content = [dict(type="text", text=node_text[:max_text])] + curr_node.images[:max_images]
-            else:
-                content = node_text[:max_text]
-
-            if content != "":
-                messages.append(dict(content=content, role=curr_node.role))
-
-            if len(node_text) > max_text:
-                user_warnings.add(f"⚠️ Max {max_text:,} characters per message")
-            if len(curr_node.images) > max_images:
-                user_warnings.add(
-                    f"⚠️ Max {max_images} image{'' if max_images == 1 else 's'} per message"
-                    if max_images > 0
-                    else "⚠️ Can't see images"
-                )
-            if curr_node.has_bad_attachments:
-                user_warnings.add("⚠️ Unsupported attachments")
-            if curr_node.fetch_parent_failed or (curr_node.parent_msg is not None and len(messages) == max_messages):
-                user_warnings.add(f"⚠️ Only using last {len(messages)} message{'' if len(messages) == 1 else 's'}")
-
-            curr_msg = curr_node.parent_msg
+    messages, user_warnings = await _build_conversation(
+        new_msg, max_text=max_text, max_images=max_images, max_messages=max_messages
+    )
 
     logging.info(
         "Message received (user ID: %s, attachments: %s, conversation length: %s):\n%s",
@@ -612,35 +699,7 @@ async def on_message(new_msg: discord.Message) -> None:
         new_msg.content,
     )
 
-    try:
-        memory_backend = _memory_backend(config)
-    except Exception:
-        logging.exception("WDBX memory configuration failed; continuing without durable memory")
-        memory_backend = None
-
-    if memory_backend is not None:
-        # The ABI MCP path deliberately sends only the current user text, so it discards
-        # `messages` entirely. Recalling into a list nobody reads would pay the WDBX
-        # timeout on every message for nothing. Writes still run: an explicit "remember"
-        # must persist regardless of which provider answers.
-        if provider_backend != "abi-mcp":
-            try:
-                memories = await memory_backend.recall(scope=_memory_scope(new_msg), query=new_msg.content)
-                if memory_context := render_memory_context(memories):
-                    messages.append(dict(role="user", content=memory_context))
-            except Exception:
-                logging.exception("WDBX memory recall failed; continuing without recalled memory")
-        if should_store_memory(new_msg.content):
-            try:
-                await memory_backend.remember(
-                    scope=_memory_scope(new_msg),
-                    author_id=str(new_msg.author.id),
-                    role="user",
-                    content=new_msg.content,
-                    message_id=str(new_msg.id),
-                )
-            except Exception:
-                logging.exception("WDBX memory write failed")
+    await _apply_memory(messages, new_msg, provider_backend=provider_backend)
 
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
@@ -659,28 +718,6 @@ async def on_message(new_msg: discord.Message) -> None:
         extra_query=extra_query,
         extra_body=extra_body,
     )
-
-    async def completion_chunks():
-        if provider_backend == "abi-mcp":
-            abi = AbiMcpBackend(
-                _backend_httpx_client(),
-                base_url=provider_config["base_url"],
-                token=provider_config.get("token"),
-                tool=provider_config.get("tool", "ai_run"),
-                evidence_limit=int(provider_config.get("evidence_limit", 5)),
-                timeout_seconds=float(provider_config.get("timeout_seconds", 30)),
-            )
-            text = await abi.complete(new_msg.content, model)
-            for start in range(0, len(text), 1_000):
-                end = min(start + 1_000, len(text))
-                yield text[start:end], "stop" if end == len(text) else None
-            return
-
-        assert openai_client is not None
-        async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
-            choice = chunk.choices[0] if chunk.choices else None
-            if choice is not None:
-                yield choice.delta.content or "", choice.finish_reason
 
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
@@ -702,7 +739,15 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         async with new_msg.channel.typing():
-            async for chunk_content, chunk_finish_reason in completion_chunks():
+            chunks = _completion_chunks(
+                provider_backend=provider_backend,
+                provider_config=provider_config,
+                openai_client=openai_client,
+                openai_kwargs=openai_kwargs,
+                user_text=new_msg.content,
+                model=model,
+            )
+            async for chunk_content, chunk_finish_reason in chunks:
                 if finish_reason is not None:
                     break
 
