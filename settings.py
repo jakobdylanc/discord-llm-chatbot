@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
 import os
 from datetime import datetime
 from typing import Any
 
 import yaml
+
+from backends import DEFAULT_MIN_SCORE, validate_loopback_url
 
 VISION_MODEL_TAGS = (
     "chat-latest",
@@ -19,6 +22,7 @@ VISION_MODEL_TAGS = (
     "vision",
     "vl",
 )
+ABI_MCP_TOOLS = {"ai_run", "ai_complete", "ai_learn"}
 
 
 class ConfigError(ValueError):
@@ -68,6 +72,20 @@ def coerce_ids(value: Any) -> list[int]:
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"cannot parse id list from {value!r}") from exc
     raise ConfigError(f"cannot parse id list from {type(value).__name__}")
+
+
+def coerce_bool(value: Any, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    if value is None:
+        return False
+    raise ConfigError(f"{name} must be a boolean")
 
 
 def coerce_permission_ids(config: dict[str, Any]) -> dict[str, Any]:
@@ -126,10 +144,63 @@ def validate_config(config: dict[str, Any]) -> None:
     providers = config.get("providers") or {}
     if not isinstance(providers, dict):
         raise ConfigError("config.yaml providers must be a mapping")
+    for provider_name, provider_config in providers.items():
+        if not isinstance(provider_config, dict):
+            raise ConfigError(f"provider {provider_name!r} must be a mapping")
+        backend = provider_config.get("backend", "openai")
+        if backend not in {"openai", "abi-mcp"}:
+            raise ConfigError(f"provider {provider_name!r} has unsupported backend {backend!r}")
+        if not provider_config.get("base_url"):
+            raise ConfigError(f"provider {provider_name!r} is missing base_url")
+        if backend == "abi-mcp":
+            try:
+                validate_loopback_url(str(provider_config["base_url"]))
+                if provider_config.get("tool", "ai_run") not in ABI_MCP_TOOLS:
+                    raise ValueError("tool must be ai_run, ai_complete, or ai_learn")
+                evidence_limit = int(provider_config.get("evidence_limit", 5))
+                timeout_seconds = float(provider_config.get("timeout_seconds", 30))
+                if not 1 <= evidence_limit <= 25:
+                    raise ValueError("evidence_limit must be between 1 and 25")
+                if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                    raise ValueError("timeout_seconds must be positive")
+            except (TypeError, ValueError) as exc:
+                raise ConfigError(f"provider {provider_name!r} configuration is invalid: {exc}") from exc
+
     for name in models:
         provider, _model = split_provider_model(str(name))
         if provider not in providers:
             raise ConfigError(f"model {name!r} references unknown provider {provider!r}")
+
+    memory = config.get("memory") or {}
+    if not isinstance(memory, dict):
+        raise ConfigError("config.yaml memory must be a mapping")
+    if coerce_bool(memory.get("enabled", False), name="memory.enabled"):
+        if memory.get("backend") != "wdbx":
+            raise ConfigError("enabled memory backend must be 'wdbx'")
+        if not memory.get("base_url"):
+            raise ConfigError("enabled WDBX memory is missing base_url")
+        try:
+            validate_loopback_url(str(memory["base_url"]))
+            limit = int(memory.get("limit", 5))
+            max_memory_chars = int(memory.get("max_memory_chars", 2_000))
+            namespace = str(memory.get("namespace", "llmcord"))
+            min_score = float(memory.get("min_score", DEFAULT_MIN_SCORE))
+            timeout_seconds = float(memory.get("timeout_seconds", 3))
+            if not 1 <= limit <= 25:
+                raise ValueError("limit must be between 1 and 25")
+            if not 1 <= max_memory_chars <= 3_000:
+                raise ValueError("max_memory_chars must be between 1 and 3000")
+            if not 1 <= len(namespace) <= 64 or any(
+                character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+                for character in namespace
+            ):
+                raise ValueError("namespace must contain 1-64 letters, numbers, '.', '_', or '-'")
+            if not math.isfinite(min_score) or not -1 <= min_score <= 1:
+                raise ValueError("min_score must be finite and between -1 and 1")
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                raise ValueError("timeout_seconds must be positive")
+        except (TypeError, ValueError) as exc:
+            raise ConfigError(f"WDBX memory configuration is invalid: {exc}") from exc
 
 
 def load_and_validate(filename: str = "config.yaml") -> dict[str, Any]:

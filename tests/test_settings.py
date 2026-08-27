@@ -5,6 +5,7 @@ import pytest
 
 from settings import (
     ConfigError,
+    coerce_bool,
     coerce_ids,
     default_model,
     format_system_prompt,
@@ -55,6 +56,14 @@ def test_coerce_ids_rejects_junk() -> None:
         coerce_ids("not-an-id")
 
 
+def test_coerce_bool_accepts_yaml_and_env_forms() -> None:
+    assert coerce_bool(True, name="flag")
+    assert coerce_bool("YES", name="flag")
+    assert not coerce_bool("0", name="flag")
+    with pytest.raises(ConfigError, match="boolean"):
+        coerce_bool("sometimes", name="flag")
+
+
 def test_split_provider_model_strips_vision_suffix() -> None:
     assert split_provider_model("x-ai/grok-4.6:vision") == ("x-ai", "grok-4.6")
     assert split_provider_model("ollama/llama4") == ("ollama", "llama4")
@@ -92,7 +101,7 @@ def test_validate_config_requires_token_models_and_known_provider() -> None:
             {
                 "bot_token": "t",
                 "models": {"missing/grok": {}},
-                "providers": {"x-ai": {}},
+                "providers": {"x-ai": {"base_url": "https://api.x.ai/v1"}},
             }
         )
     validate_config(
@@ -102,6 +111,47 @@ def test_validate_config_requires_token_models_and_known_provider() -> None:
             "providers": {"x-ai": {"base_url": "https://api.x.ai/v1"}},
         }
     )
+
+
+def test_validate_config_rejects_unsafe_or_invalid_local_backends() -> None:
+    base = {
+        "bot_token": "t",
+        "models": {"abi/local": {}},
+        "providers": {"abi": {"backend": "abi-mcp", "base_url": "https://remote.example"}},
+    }
+    with pytest.raises(ConfigError, match="loopback"):
+        validate_config(base)
+
+    base["providers"]["abi"] = {
+        "backend": "abi-mcp",
+        "base_url": "http://127.0.0.1:8080",
+        "tool": "unknown",
+    }
+    with pytest.raises(ConfigError, match="tool"):
+        validate_config(base)
+
+    base["providers"]["abi"] = {
+        "backend": "abi-mcp",
+        "base_url": "http://127.0.0.1:8080/nested",
+        "tool": "ai_run",
+    }
+    with pytest.raises(ConfigError, match="path"):
+        validate_config(base)
+
+    base["providers"]["abi"]["base_url"] = "http://127.0.0.1:8080"
+    base["memory"] = {
+        "enabled": True,
+        "backend": "wdbx",
+        "base_url": "http://127.0.0.1:8081",
+        "limit": 101,
+    }
+    with pytest.raises(ConfigError, match="limit"):
+        validate_config(base)
+
+    base["memory"]["limit"] = 5
+    base["memory"]["timeout_seconds"] = "nan"
+    with pytest.raises(ConfigError, match="timeout"):
+        validate_config(base)
 
 
 def _perms(*, admin=(), users=(), blocked_users=(), roles=(), blocked_roles=(), channels=(), blocked_channels=()):
@@ -190,4 +240,8 @@ def test_repo_config_yaml_declares_xai_default(monkeypatch: pytest.MonkeyPatch) 
     assert learning["cooldown_seconds"] == 20
     assert learning["unsolicited_per_hour"] == 6
     assert learning["reward_window_seconds"] == 150
+    assert not coerce_bool(cfg["memory"]["enabled"], name="memory.enabled")
+    assert cfg["memory"]["backend"] == "wdbx"
+    assert cfg["providers"]["abi"]["backend"] == "abi-mcp"
+    assert "abi/abbey-local" in cfg["models"]
     validate_config(cfg)

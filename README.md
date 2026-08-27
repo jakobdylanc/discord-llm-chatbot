@@ -31,7 +31,7 @@ Additionally:
 
 This checkout is a [uv](https://docs.astral.sh/uv/) Python 3.12 Abbey bot on top of llmcord. Default model is **xAI grok-4.6** (`XAI_API_KEY`). Run with `uv run python main.py`.
 
-It transcribes Abbey's stay/reply/react DQN (`[18, 64, 32, 3]`, delayed 150 s rewards) into pure Python. Learning and unsolicited speech are **default off** (`/learn on`, `/act on`). This is not AbbeyBot (Swift), not abbey-bot (Rust), and not WDBX. Mentions and DMs still always reply.
+It transcribes Abbey's stay/reply/react DQN (`[18, 64, 32, 3]`, delayed 150 s rewards) into pure Python. Learning and unsolicited speech are **default off** (`/learn on`, `/act on`). Mentions and DMs still always reply. SQLite and JSON remain the DQN state store; optional loopback adapters add explicit WDBX memory and ABI MCP persona routing without importing either Rust repository as a Python package.
 
 ---
 
@@ -58,13 +58,15 @@ Or run local models with:
 - Supports text file attachments (.txt, .py, .c, etc.)
 - Customizable personality (aka system prompt)
 - Distinguishes users via their Discord IDs
-- Streamed responses (turns green when complete, automatically splits into separate messages when too long)
+- Streamed OpenAI-compatible responses (turns green when complete, automatically splits into separate messages when too long); ABI MCP returns one bounded response that is split for Discord.
 - Hot reloading config (you can change settings without restarting the bot)
 - Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
 - Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
 - Fully asynchronous
 - Hot-reloaded YAML config, env-backed secrets, and a `uv` project layout (`main.py` entrypoint)
 - Per-guild DQN (`/learn`, `/act`, `/brain`): stay / reply / react, replay buffer, 150 s reaction rewards. Inspectable; not a hosted fine-tune.
+- Optional WDBX memory through the loopback REST sidecar. Memory is disabled by default, scoped to one Discord channel or DM user, and only explicit "remember" / "note that" requests are persisted.
+- Optional ABI MCP provider (`abi/abbey-local`) through the loopback JSON-RPC compatibility endpoint. It sends only the current user text to ABI's deterministic local persona router, not the system prompt, reply chain, recalled memory, or a hosted model.
 
 ## Instructions
 
@@ -96,7 +98,7 @@ Or run local models with:
 
 | Setting | Description |
 | --- | --- |
-| **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. This checkout defaults to `x-ai` at `https://api.x.ai/v1` using `XAI_API_KEY`. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are also included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
+| **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. This checkout defaults to `x-ai` at `https://api.x.ai/v1` using `XAI_API_KEY`. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are also included.<br /><br />Most providers use an OpenAI `/v1/chat/completions` compatible API. The included `abi` provider instead uses ABI's custom loopback MCP JSON-RPC endpoint.<br /><br />Some OpenAI-compatible providers may need `extra_headers` / `extra_query` / `extra_body` entries. See the included `azure-openai` provider for an example. |
 | **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
 
@@ -124,6 +126,36 @@ Or run local models with:
    `uv run pytest` and `uv run ruff check .` are the local gate. `python llmcord.py` still works.
 
    Admins: `/learn on` then `/act on` in a private guild before expecting unsolicited stay/reply/react. Set `DISCORD_DEV_GUILD_ID` so slash commands register guild-scoped. Brains persist under `~/.abbey/`.
+
+### Optional local backends
+
+WDBX and ABI are Rust services with HTTP boundaries; they do not currently expose Python packages. Build the ABI binaries from the canonical sibling checkouts:
+
+```bash
+cd "$ABI_REPO_PATH"
+./tools/cargo.sh build --release -p abi-cli -p abi-mcp
+```
+
+Start WDBX REST against a dedicated llmcord store, then set `WDBX_ENABLED=1`:
+
+```bash
+ABI_WDBX_PATH="$HOME/.abbey/wdbx" \
+  "$ABI_REPO_PATH/target/release/abi" wdbx api serve 8081
+```
+
+Start ABI MCP to use the `abi/abbey-local` model entry:
+
+```bash
+ABI_WDBX_PATH="$HOME/.abbey/abi-wdbx" \
+  ABI_MCP_HTTP_PORT=8080 \
+  "$ABI_REPO_PATH/target/release/abi-mcp"
+```
+
+`abi-mcp` also serves a stdio MCP loop, so it exits as soon as stdin reaches EOF. It stays
+up in a normal terminal; if you background or detach it, hold stdin open
+(`tail -f /dev/null | abi-mcp &`) or it will print its listening banner and immediately quit.
+
+Both listeners bind to loopback. `ABI_WDBX_REST_TOKEN` and `ABI_MCP_HTTP_TOKEN` add optional bearer checks; they do not provide TLS or multi-user authorization. The Python adapters reject non-loopback URLs so configured tokens cannot be sent to a remote host.
 
 ## Notes
 

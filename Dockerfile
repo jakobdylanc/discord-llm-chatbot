@@ -13,6 +13,6 @@ ENV UV_COMPILE_BYTECODE=1 \
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
 
-COPY llmcord.py main.py settings.py brain.py encoder.py social.py learning.py config.yaml ./
+COPY llmcord.py main.py settings.py backends.py brain.py encoder.py social.py learning.py config.yaml ./
 
 CMD ["python", "main.py"]

@@ -17,13 +17,20 @@ from discord.ui import LayoutView, TextDisplay
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+from backends import (
+    DEFAULT_MIN_SCORE,
+    AbiMcpBackend,
+    WdbxMemoryBackend,
+    render_memory_context,
+    should_store_memory,
+)
 from encoder import encode_state
 from learning import Action, LearningStore, command_sync_mode, decide_action, emoji_score
 from settings import (
     ConfigError,
+    coerce_bool,
     default_model,
     format_system_prompt,
-    get_config,
     is_message_allowed,
     is_vision_model,
     load_and_validate,
@@ -46,6 +53,7 @@ EDIT_DELAY_SECONDS = 1
 MAX_MESSAGE_NODES = 500
 
 config: dict[str, Any] = {}
+config_filename = "config.yaml"
 curr_model = ""
 last_task_time = 0.0
 edit_lock = asyncio.Lock()
@@ -55,6 +63,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 discord_bot = commands.Bot(intents=intents, command_prefix=None)
 httpx_client = None
+backend_httpx_client = None
 
 
 @dataclass
@@ -90,10 +99,31 @@ def _guild_key(interaction_or_msg: discord.Interaction | discord.Message) -> str
     return str(guild.id) if guild else "dm"
 
 
+def _memory_scope(msg: discord.Message) -> str:
+    return f"guild:{msg.guild.id}:channel:{msg.channel.id}" if msg.guild else f"dm:{msg.author.id}"
+
+
+def _memory_backend(cfg: dict[str, Any]) -> WdbxMemoryBackend | None:
+    memory = cfg.get("memory") or {}
+    if not coerce_bool(memory.get("enabled", False), name="memory.enabled"):
+        return None
+    return WdbxMemoryBackend(
+        _backend_httpx_client(),
+        base_url=str(memory["base_url"]),
+        token=memory.get("token"),
+        limit=int(memory.get("limit", 5)),
+        max_memory_chars=int(memory.get("max_memory_chars", 2_000)),
+        namespace=str(memory.get("namespace", "llmcord")),
+        min_score=float(memory.get("min_score", DEFAULT_MIN_SCORE)),
+        timeout_seconds=float(memory.get("timeout_seconds", 3)),
+    )
+
+
 def configure(filename: str = "config.yaml", *, init_store: bool = True) -> dict[str, Any]:
-    global config, curr_model, learning_store
+    global config, config_filename, curr_model, learning_store
     load_dotenv()
     config = load_and_validate(filename)
+    config_filename = filename
     if not curr_model or curr_model not in config["models"]:
         curr_model = default_model(config["models"])
     status = (config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128]
@@ -111,6 +141,15 @@ def _httpx_client():
 
         httpx_client = httpx.AsyncClient()
     return httpx_client
+
+
+def _backend_httpx_client():
+    global backend_httpx_client
+    if backend_httpx_client is None:
+        import httpx
+
+        backend_httpx_client = httpx.AsyncClient(trust_env=False)
+    return backend_httpx_client
 
 
 @discord_bot.tree.command(name="model", description="View or switch the current model")
@@ -132,11 +171,13 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
 
 @model_command.autocomplete("model")
 async def model_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
-    global config
+    global config, curr_model
 
     if curr_str == "":
         try:
-            config = await asyncio.to_thread(get_config)
+            config = await asyncio.to_thread(load_and_validate, config_filename)
+            if curr_model not in config["models"]:
+                curr_model = default_model(config["models"])
         except (OSError, ConfigError):
             logging.exception("Failed to reload config for /model autocomplete")
 
@@ -304,7 +345,7 @@ async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
 
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
-    global last_task_time, config
+    global last_task_time, config, curr_model
 
     if new_msg.author.bot:
         return
@@ -329,7 +370,9 @@ async def on_message(new_msg: discord.Message) -> None:
     )
 
     try:
-        config = await asyncio.to_thread(get_config)
+        config = await asyncio.to_thread(load_and_validate, config_filename)
+        if curr_model not in config["models"]:
+            curr_model = default_model(config["models"])
     except (OSError, ConfigError):
         logging.exception("Failed to reload config.yaml")
         return
@@ -419,9 +462,12 @@ async def on_message(new_msg: discord.Message) -> None:
         logging.error("Provider %r is not in config.yaml", provider)
         return
 
-    base_url = provider_config["base_url"]
-    api_key = provider_config.get("api_key") or "sk-no-key-required"
-    openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    provider_backend = provider_config.get("backend", "openai")
+    openai_client = None
+    if provider_backend == "openai":
+        base_url = provider_config["base_url"]
+        api_key = provider_config.get("api_key") or "sk-no-key-required"
+        openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     model_parameters = config["models"].get(provider_slash_model, None)
 
@@ -566,6 +612,36 @@ async def on_message(new_msg: discord.Message) -> None:
         new_msg.content,
     )
 
+    try:
+        memory_backend = _memory_backend(config)
+    except Exception:
+        logging.exception("WDBX memory configuration failed; continuing without durable memory")
+        memory_backend = None
+
+    if memory_backend is not None:
+        # The ABI MCP path deliberately sends only the current user text, so it discards
+        # `messages` entirely. Recalling into a list nobody reads would pay the WDBX
+        # timeout on every message for nothing. Writes still run: an explicit "remember"
+        # must persist regardless of which provider answers.
+        if provider_backend != "abi-mcp":
+            try:
+                memories = await memory_backend.recall(scope=_memory_scope(new_msg), query=new_msg.content)
+                if memory_context := render_memory_context(memories):
+                    messages.append(dict(role="user", content=memory_context))
+            except Exception:
+                logging.exception("WDBX memory recall failed; continuing without recalled memory")
+        if should_store_memory(new_msg.content):
+            try:
+                await memory_backend.remember(
+                    scope=_memory_scope(new_msg),
+                    author_id=str(new_msg.author.id),
+                    role="user",
+                    content=new_msg.content,
+                    message_id=str(new_msg.id),
+                )
+            except Exception:
+                logging.exception("WDBX memory write failed")
+
     if system_prompt := config.get("system_prompt"):
         now = datetime.now().astimezone()
         messages.append(dict(role="system", content=format_system_prompt(system_prompt, now)))
@@ -583,6 +659,28 @@ async def on_message(new_msg: discord.Message) -> None:
         extra_query=extra_query,
         extra_body=extra_body,
     )
+
+    async def completion_chunks():
+        if provider_backend == "abi-mcp":
+            abi = AbiMcpBackend(
+                _backend_httpx_client(),
+                base_url=provider_config["base_url"],
+                token=provider_config.get("token"),
+                tool=provider_config.get("tool", "ai_run"),
+                evidence_limit=int(provider_config.get("evidence_limit", 5)),
+                timeout_seconds=float(provider_config.get("timeout_seconds", 30)),
+            )
+            text = await abi.complete(new_msg.content, model)
+            for start in range(0, len(text), 1_000):
+                end = min(start + 1_000, len(text))
+                yield text[start:end], "stop" if end == len(text) else None
+            return
+
+        assert openai_client is not None
+        async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
+            choice = chunk.choices[0] if chunk.choices else None
+            if choice is not None:
+                yield choice.delta.content or "", choice.finish_reason
 
     if use_plain_responses := config.get("use_plain_responses", False):
         max_message_length = 4000
@@ -604,17 +702,14 @@ async def on_message(new_msg: discord.Message) -> None:
 
     try:
         async with new_msg.channel.typing():
-            async for chunk in await openai_client.chat.completions.create(**openai_kwargs):
+            async for chunk_content, chunk_finish_reason in completion_chunks():
                 if finish_reason is not None:
                     break
 
-                if not (choice := chunk.choices[0] if chunk.choices else None):
-                    continue
-
-                finish_reason = choice.finish_reason
+                finish_reason = chunk_finish_reason
 
                 prev_content = curr_content or ""
-                curr_content = choice.delta.content or ""
+                curr_content = chunk_content
 
                 new_content = prev_content if finish_reason is None else (prev_content + curr_content)
 
@@ -700,6 +795,9 @@ async def run_bot() -> None:
         client = httpx_client
         if client is not None:
             await client.aclose()
+        backend_client = backend_httpx_client
+        if backend_client is not None:
+            await backend_client.aclose()
         if not discord_bot.is_closed():
             await discord_bot.close()
 

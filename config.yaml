@@ -8,6 +8,23 @@ status_message: Abbey · llmcord
 
 data_path_env: ABBEY_DATA_PATH
 
+# Optional explicit memory. The WDBX sidecar is local-only and disabled until
+# WDBX_ENABLED=1. Only "remember" / "note that" messages are persisted.
+memory:
+  enabled: false
+  enabled_env: WDBX_ENABLED
+  backend: wdbx
+  base_url: http://127.0.0.1:8081
+  base_url_env: WDBX_URL
+  token_env: ABI_WDBX_REST_TOKEN
+  namespace: llmcord
+  namespace_env: WDBX_NAMESPACE
+  limit: 5
+  # Minimum content cosine. See DEFAULT_MIN_SCORE in backends.py for the live calibration.
+  min_score: 0.35
+  max_memory_chars: 2000
+  timeout_seconds: 3
+
 learning:
   default_enabled: false
   default_act: false
@@ -73,6 +90,17 @@ providers:
   vllm:
     base_url: http://localhost:8000/v1
 
+  # ABI's loopback MCP compatibility endpoint. This is a local persona router,
+  # not an OpenAI-compatible hosted model API.
+  abi:
+    backend: abi-mcp
+    base_url: http://127.0.0.1:8080
+    base_url_env: ABI_MCP_HTTP_URL
+    token_env: ABI_MCP_HTTP_TOKEN
+    tool: ai_run
+    evidence_limit: 5
+    timeout_seconds: 30
+
 # First model is the default at startup. Switch live with /model (admins only).
 models:
   x-ai/grok-4.6:
@@ -91,6 +119,8 @@ models:
     tools:
       - type: openrouter:web_search
       - type: openrouter:web_fetch
+
+  abi/abbey-local:
 
   ollama/llama4:
 

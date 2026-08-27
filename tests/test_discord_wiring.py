@@ -37,6 +37,16 @@ def test_reaction_delete_settle_and_slash_commands_exist() -> None:
     assert 'name="brain"' in src
     assert "command_sync_mode" in src
     assert "copy_global_to" in src
+    assert "WdbxMemoryBackend" in src
+    assert "render_memory_context" in src
+    assert "AbiMcpBackend" in src
+    assert "completion_chunks" in src
+    assert "trust_env=False" in src
+    assert 'messages.append(dict(role="user", content=memory_context))' in src
+    assert "load_and_validate, config_filename" in src
+
+    dockerfile = Path("Dockerfile").read_text(encoding="utf-8")
+    assert "backends.py" in dockerfile
 
 
 def test_shipped_policy_and_sync_functions() -> None:
