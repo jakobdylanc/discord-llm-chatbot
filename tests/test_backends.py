@@ -310,3 +310,29 @@ def test_abi_tool_output_strips_metadata_blob_and_persona_label() -> None:
                 return await backend.complete("anything", "abbey-local")
 
         assert asyncio.run(run()) == body, tool
+
+
+def test_abi_metadata_split_anchors_on_block_id_not_the_first_colon() -> None:
+    """A metadata value containing ': ' must not eat the reply.
+
+    The first-": " split was correct only by luck on the payloads captured live; a
+    single ABI-side metadata addition would have silently truncated every response.
+    """
+    body = "Loopback keeps the bridge on this host."
+    hostile = (
+        "requested_model=abbey-local note=see: this provider=local "
+        f"block_id=679bf8d695697089749da74867a9c29f: Abbey: {body}"
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": hostile}]}},
+        )
+
+    async def run() -> str:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            backend = AbiMcpBackend(client, base_url="http://127.0.0.1:8090", tool="ai_complete")
+            return await backend.complete("anything", "abbey-local")
+
+    assert asyncio.run(run()) == body

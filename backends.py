@@ -31,6 +31,10 @@ _MENTION_PREFIX = re.compile(r"^(?:<@!?\d+>\s*)+")
 # live 2026-08-27 against `abi-mcp`. Single bare word only, so ordinary prose that
 # happens to contain a colon is left alone.
 _PERSONA_LABEL = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}: ")
+# ai_complete / ai_learn prefix the reply with a `key=value ...` blob terminated by
+# `block_id=<hex>: `. Anchoring on that marker beats splitting at the first ": ",
+# which would eat the reply if ABI ever emits a metadata value containing ": ".
+_ABI_METADATA = re.compile(r"^.*?\bblock_id=[0-9a-f]+:\s+", re.DOTALL)
 _MEMORY_REQUESTS = (
     re.compile(r"^(?:please\s+)?(?:remember(?:\s+that)?|note\s+that)\b"),
     re.compile(r"^(?:can|could|would|will)\s+you\s+(?:please\s+)?remember(?:\s+that)?\b"),
@@ -369,9 +373,12 @@ class AbiMcpBackend:
         ).strip()
         if not text:
             raise BackendError("ABI MCP tool returned no text")
-        # ai_complete / ai_learn wrap the reply in a `key=value ... block_id=<hex>: ` blob.
-        if self.tool in {"ai_complete", "ai_learn"} and ": " in text:
-            text = text.split(": ", 1)[1]
+        if self.tool in {"ai_complete", "ai_learn"}:
+            stripped, hits = _ABI_METADATA.subn("", text, count=1)
+            if hits:
+                text = stripped
+            elif ": " in text:
+                text = text.split(": ", 1)[1]
         return _PERSONA_LABEL.sub("", text, count=1).strip() or text
 
     async def _rpc(self, method: str, params: dict[str, Any] | None = None) -> Any:

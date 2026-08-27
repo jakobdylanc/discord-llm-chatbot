@@ -10,5 +10,4 @@
 ### Open, not blocking the goal
 
 - [ ] Exercise the bridge through a real Discord message (needs operator tokens in `.env`)
-- [ ] Replace the first-`": "` metadata split in `AbiMcpBackend.complete` with a marker anchored on `block_id=`
 - [ ] Revisit the recall embedding if memory is ever relied on; threshold tuning is at its useful limit
