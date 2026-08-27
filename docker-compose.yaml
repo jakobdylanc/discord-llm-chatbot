@@ -7,4 +7,4 @@ services:
       - path: .env
         required: false
     volumes:
-      - ./:/app:ro
+      - ./config.yaml:/app/config.yaml:ro

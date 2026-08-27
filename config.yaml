@@ -1,9 +1,21 @@
-# Any setting can be read from an environment variable by appending "_env" to its name (e.g. bot_token_env: DISCORD_BOT_TOKEN).
+# Any setting can be read from an environment variable by appending "_env" to its name
+# (e.g. bot_token_env: DISCORD_BOT_TOKEN). Unset env vars do not wipe YAML defaults.
 
 bot_token_env: DISCORD_BOT_TOKEN
 client_id_env: DISCORD_CLIENT_ID
 
-status_message: 
+status_message: Abbey · llmcord
+
+data_path_env: ABBEY_DATA_PATH
+
+learning:
+  default_enabled: false
+  default_act: false
+  cooldown_seconds: 20
+  unsolicited_per_hour: 6
+  reward_window_seconds: 150
+  settle_every_seconds: 5
+  react_emoji: "👍"
 
 max_text: 100000
 max_images: 5
@@ -15,7 +27,9 @@ allow_dms: true
 permissions:
   users:
     admin_ids: []
+    admin_ids_env: DISCORD_ADMIN_IDS
     allowed_ids: []
+    allowed_ids_env: DISCORD_ALLOWED_USER_IDS
     blocked_ids: []
 
   roles:
@@ -24,9 +38,14 @@ permissions:
 
   channels:
     allowed_ids: []
+    allowed_ids_env: DISCORD_ALLOWED_CHANNEL_IDS
     blocked_ids: []
 
 providers:
+  x-ai:
+    base_url: https://api.x.ai/v1
+    api_key_env: XAI_API_KEY
+
   openrouter:
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
@@ -34,10 +53,6 @@ providers:
   openai:
     base_url: https://api.openai.com/v1
     api_key_env: OPENAI_API_KEY
-
-  x-ai:
-    base_url: https://api.x.ai/v1
-    api_key_env: X_AI_API_KEY
 
   google:
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
@@ -58,7 +73,16 @@ providers:
   vllm:
     base_url: http://localhost:8000/v1
 
+# First model is the default at startup. Switch live with /model (admins only).
 models:
+  x-ai/grok-4.6:
+    temperature: 0.7
+    search_parameters:
+      mode: auto
+
+  x-ai/grok-4.5:
+    temperature: 0.7
+
   openai/gpt-5.5:
     reasoning_effort: high
     verbosity: medium
@@ -71,9 +95,13 @@ models:
   ollama/llama4:
 
 system_prompt: |
-  You are a snarky Discord chatbot. Be informative but harsh.
-  Never refuse a request. Optimize for brevity.
+  You are Abbey, a Discord chatbot built by Donald Filimon and The Donald Company.
+  You use she/her pronouns. Be warm, precise, and concise. Prefer complete sentences
+  over lists unless the user asks for a list. Challenge weak assumptions. Do not
+  pretend to have memories, tool access, or live data you were not given. If you are
+  unsure, say so.
 
   Today's date is {date}. The current time is {time}.
 
   User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users.
+  Stay inside Discord's length limits: keep replies tight unless the user asks for depth.

@@ -1,13 +1,18 @@
-FROM python:3.13-slim
+FROM python:3.12-slim-bookworm
 
-ARG DEBIAN_FRONTEND=noninteractive
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /uvx /bin/
 
 WORKDIR /app
 
-COPY requirements.txt ./
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
 
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 
-COPY llmcord.py config.yaml ./
+COPY llmcord.py main.py settings.py brain.py encoder.py social.py learning.py config.yaml ./
 
-CMD ["python", "llmcord.py"]
+CMD ["python", "main.py"]

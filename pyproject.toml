@@ -1,0 +1,42 @@
+[project]
+name = "llmcord"
+version = "1.0.0"
+description = "Talk to LLMs with your friends on Discord"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "discord.py>=2.6.0",
+    "httpx>=0.28",
+    "openai>=1.60",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[tool.uv]
+package = false
+default-groups = ["dev"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = [
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+src = [".", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+"llmcord.py" = ["E501", "B008"]

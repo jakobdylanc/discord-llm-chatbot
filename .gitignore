@@ -3,6 +3,8 @@
 *
 
 !.gitignore
+!.python-version
+!.env.example
 
 !*.md
 !*.py
@@ -10,4 +12,12 @@
 !Dockerfile
 !config.yaml
 !docker-compose.yaml
+!pyproject.toml
+!uv.lock
 !requirements.txt
+
+!tests/
+!tests/*.py
+
+!tasks/
+!tasks/*.md

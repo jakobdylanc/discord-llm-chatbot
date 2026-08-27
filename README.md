@@ -29,6 +29,10 @@ Additionally:
 - You can branch conversations into [threads](https://support.discord.com/hc/en-us/articles/4403205878423-Threads-FAQ). Just create a thread from any message and @ the bot inside to continue.
 - Back-to-back messages from the same user are automatically chained together. Just reply to the latest one and the bot will see all of them.
 
+This checkout is a [uv](https://docs.astral.sh/uv/) Python 3.12 Abbey bot on top of llmcord. Default model is **xAI grok-4.6** (`XAI_API_KEY`). Run with `uv run python main.py`.
+
+It transcribes Abbey's stay/reply/react DQN (`[18, 64, 32, 3]`, delayed 150 s rewards) into pure Python. Learning and unsolicited speech are **default off** (`/learn on`, `/act on`). This is not AbbeyBot (Swift), not abbey-bot (Rust), and not WDBX. Mentions and DMs still always reply.
+
 ---
 
 ### Model switching with `/model`:
@@ -59,7 +63,8 @@ Or run local models with:
 - Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
 - Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
 - Fully asynchronous
-- 1 Python file, ~300 lines of code
+- Hot-reloaded YAML config, env-backed secrets, and a `uv` project layout (`main.py` entrypoint)
+- Per-guild DQN (`/learn`, `/act`, `/brain`): stay / reply / react, replay buffer, 150 s reaction rewards. Inspectable; not a hosted fine-tune.
 
 ## Instructions
 
@@ -91,22 +96,34 @@ Or run local models with:
 
 | Setting | Description |
 | --- | --- |
-| **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
+| **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. This checkout defaults to `x-ai` at `https://api.x.ai/v1` using `XAI_API_KEY`. Popular providers (`openrouter`, `openai`, `ollama`, etc.) are also included.<br /><br />**Only supports OpenAI /v1/chat/completions compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
 | **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
 | **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
 
 3. Run the bot:
 
-   **No Docker:**
+   **uv (preferred):**
    ```bash
-   python -m pip install -U -r requirements.txt
-   python llmcord.py
+   cp .env.example .env   # set DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID, XAI_API_KEY
+   uv sync
+   uv run python main.py --check-config
+   uv run python main.py
    ```
 
-   **With Docker:**
+   **pip:**
+   ```bash
+   python -m pip install -U -r requirements.txt
+   python main.py
+   ```
+
+   **Docker:**
    ```bash
    docker compose up
    ```
+
+   `uv run pytest` and `uv run ruff check .` are the local gate. `python llmcord.py` still works.
+
+   Admins: `/learn on` then `/act on` in a private guild before expecting unsolicited stay/reply/react. Set `DISCORD_DEV_GUILD_ID` so slash commands register guild-scoped. Brains persist under `~/.abbey/`.
 
 ## Notes
 
