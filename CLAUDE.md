@@ -50,21 +50,23 @@ Layered, one direction, no cycles. Only `main.py` and the tests import `llmcord`
 
 ### `on_message` decision flow
 
-Order matters and is asserted by tests (see Gotchas):
+`on_message` is orchestration; each phase is a named function above it.
 
-1. Skip bot authors; record `note_human_reply` for the referenced message.
-2. Hot-reload and validate `config.yaml` in a thread, then `is_message_allowed`.
-3. `encode_state(...)` builds the 18-float vector; `decide_action(...)` returns one of
-   `ignore` / `stay` / `react` / `reply`.
-4. `ignore`, `stay`, and `react` all **return before any provider client is built**.
-   Only `reply` proceeds.
-5. Walk the reply chain into `msg_nodes` (size-capped at `MAX_MESSAGE_NODES`, per-node
-   `asyncio.Lock`), download text/image attachments, assemble messages newest-first,
-   then send reversed.
-6. Optional WDBX recall appended as a user message, then the system prompt.
-7. Stream through OpenAI-compatible chunks, or one bounded ABI MCP response chunked at
-   1000 chars.
-8. If learning, `open_pending` on the first response message.
+1. **`_gate(new_msg) -> Gate`** owns everything up to "this message earns a reply":
+   bot authors, `note_human_reply`, config hot-reload, `is_message_allowed`,
+   `encode_state` into the 18-float vector, and `decide_action`. The `ignore`, `stay`,
+   and `react` verdicts all return `STOP`, so they **never reach a provider**; the
+   react and reply paths spend cooldown and hourly budget on the way out. `Gate` carries
+   `state` and `should_learn` forward so the reward bookkeeping need not recompute them.
+2. **`_build_conversation`** walks the reply chain into `msg_nodes` (size-capped at
+   `MAX_MESSAGE_NODES`, per-node `asyncio.Lock`), downloads text/image attachments, and
+   returns messages newest-first plus the warning set. `on_message` sends them reversed.
+3. **`_apply_memory`** appends recalled WDBX context and persists explicit remember
+   requests. Skipped for recall on the ABI path, which discards `messages`.
+4. The system prompt is appended last, so it lands first after the reversal.
+5. **`_completion_chunks`** yields `(text, finish_reason)` from either an
+   OpenAI-compatible stream or one bounded ABI response chunked at `ABI_CHUNK_CHARS`.
+6. If learning, `open_pending` on the first response message.
 
 `forced` (a DM or a direct mention) always replies and bypasses the policy, the
 cooldown, and the hourly budget. Learning and unsolicited action are **off by default
@@ -93,9 +95,13 @@ Guild key is `"dm"` for direct messages.
   error** on a topology or layer-size mismatch, so changing one side alone gives every
   guild a freshly initialized brain with no warning. Change both, and expect saved JSON
   to be dead.
-- **`tests/test_discord_wiring.py` asserts on the source text of `llmcord.py`**, using
-  `str.index` ordering inside `on_message`. Reordering that function, or renaming the
-  literals it greps for, breaks tests even when behavior is unchanged.
+- **`tests/test_discord_wiring.py` is the safety net for "nothing reaches a provider
+  before the gate allows it", and it is mutation-checked.** It drives `on_message`
+  against a fake message and traps `_build_conversation` to detect provider work. If you
+  change `_gate`, run it, and if you add a case, break the thing it guards on purpose
+  and confirm it fails. A gate test that cannot fail is worse than none. (An earlier
+  version asserted on `llmcord.py`'s source text by `str.index` ordering; it both blocked
+  legitimate refactors and would have passed an illegitimate one.)
 - **`_env` resolution is order-sensitive.** In `resolve_env`, a set env var writes to the
   bare key, and a literal key appearing *later* in the same mapping overwrites it. Always
   put `foo:` **before** `foo_env:` in `config.yaml`, or the YAML value wins over the
