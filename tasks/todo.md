@@ -11,3 +11,14 @@
 
 - [ ] Exercise the bridge through a real Discord message (needs operator tokens in `.env`)
 - [ ] Revisit the recall embedding if memory is ever relied on; threshold tuning is at its useful limit
+
+## Decompose on_message
+
+- [x] Extract _build_conversation, _apply_memory, _completion_chunks (da8d1de)
+- [x] Replace source-text wiring tests with behavioural, mutation-checked ones (51fb1bf)
+- [x] Extract _gate returning a Gate verdict (487cc40)
+- [x] Extract _stream_reply and cover the streaming loop
+
+### Open
+
+- [ ] llmcord.py is 894 lines; consider splitting the module before the next feature

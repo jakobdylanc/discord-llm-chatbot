@@ -145,3 +145,80 @@ def test_reaction_delete_and_settle_handlers_are_registered() -> None:
         assert callable(getattr(llmcord, name)), name
     commands = {c.name for c in llmcord.discord_bot.tree.get_commands()}
     assert {"model", "learn", "act", "brain"} <= commands
+
+
+class _FakeSent:
+    """Stands in for a discord.Message the bot just sent."""
+
+    _next_id = 9000
+
+    def __init__(self, **kwargs):
+        type(self)._next_id += 1
+        self.id = type(self)._next_id
+        self.kwargs = kwargs
+
+    async def reply(self, **kwargs):
+        return _FakeSent(**kwargs)
+
+    async def edit(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _FakeTyping:
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+def _streamable(monkeypatch):
+    msg = _message()
+    msg.channel.typing = lambda: _FakeTyping()
+    msg.reply = _FakeSent().reply
+    monkeypatch.setitem(llmcord.config, "use_plain_responses", True)
+    return msg
+
+
+async def _chunks(pairs):
+    for pair in pairs:
+        yield pair
+
+
+def test_stream_reply_assembles_every_chunk_including_the_first(monkeypatch, wired) -> None:
+    """The loop carries a one-chunk lag; the first chunk is easy to drop.
+
+    A regression here would silently truncate the opening of every reply, which no
+    other test in this suite would notice.
+    """
+    msg = _streamable(monkeypatch)
+    sent = asyncio.run(
+        llmcord._stream_reply(
+            msg, _chunks([("Hello ", None), ("there ", None), ("world", "stop")]), user_warnings=set()
+        )
+    )
+    assert len(sent) == 1
+    assert sent[0].kwargs["view"].children[0].content == "Hello there world"
+
+
+def test_stream_reply_splits_when_content_exceeds_the_plaintext_limit(monkeypatch, wired) -> None:
+    msg = _streamable(monkeypatch)
+    block = "x" * 2500
+    sent = asyncio.run(
+        llmcord._stream_reply(msg, _chunks([(block, None), (block, None), ("!", "stop")]), user_warnings=set())
+    )
+    assert len(sent) == 2, "5001 chars must not be crammed into one 4000-char message"
+    assert sum(len(m.kwargs["view"].children[0].content) for m in sent) == 5001
+
+
+def test_stream_reply_releases_node_locks_when_the_provider_fails(monkeypatch, wired) -> None:
+    """A mid-stream failure must not leave a message node locked forever."""
+    msg = _streamable(monkeypatch)
+
+    async def _explode():
+        yield "partial", None
+        raise RuntimeError("provider died")
+
+    sent = asyncio.run(llmcord._stream_reply(msg, _explode(), user_warnings=set()))
+    assert sent == [], "nothing was flushed before the failure"
+    assert all(not node.lock.locked() for node in llmcord.msg_nodes.values())

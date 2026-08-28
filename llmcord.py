@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 from base64 import b64encode
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -550,6 +551,112 @@ async def _apply_memory(
                 logging.exception("WDBX memory write failed")
 
 
+async def _stream_reply(
+    new_msg: discord.Message,
+    chunks: AsyncIterator[tuple[str, str | None]],
+    *,
+    user_warnings: set[str],
+) -> list[discord.Message]:
+    """Stream `chunks` into Discord, splitting and editing messages as content arrives.
+
+    Returns the messages sent, newest last. Every reply node is locked while being
+    written and released in the finally block, so a mid-stream failure still leaves the
+    cache consistent and the partial text readable by a later reply-chain walk.
+    """
+    global last_task_time
+
+    curr_content = finish_reason = None
+    response_msgs = []
+    response_contents = []
+    acquired_nodes: list[MsgNode] = []
+
+    if use_plain_responses := config.get("use_plain_responses", False):
+        max_message_length = 4000
+    else:
+        max_message_length = 4096 - len(STREAMING_INDICATOR)
+        embed = discord.Embed.from_dict(
+            dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)])
+        )
+
+    async def reply_helper(**reply_kwargs) -> None:
+        reply_target = new_msg if not response_msgs else response_msgs[-1]
+        response_msg = await reply_target.reply(**reply_kwargs)
+        response_msgs.append(response_msg)
+
+        node = MsgNode(parent_msg=new_msg)
+        msg_nodes[response_msg.id] = node
+        await node.lock.acquire()
+        acquired_nodes.append(node)
+
+    try:
+        async with new_msg.channel.typing():
+            async for chunk_content, chunk_finish_reason in chunks:
+                if finish_reason is not None:
+                    break
+
+                finish_reason = chunk_finish_reason
+
+                prev_content = curr_content or ""
+                curr_content = chunk_content
+
+                new_content = prev_content if finish_reason is None else (prev_content + curr_content)
+
+                if response_contents == [] and new_content == "":
+                    continue
+
+                if (
+                    start_next_msg := response_contents == []
+                    or len(response_contents[-1] + new_content) > max_message_length
+                ):
+                    response_contents.append("")
+
+                response_contents[-1] += new_content
+
+                if not use_plain_responses:
+                    async with edit_lock:
+                        time_delta = datetime.now().timestamp() - last_task_time
+
+                        ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
+                        msg_split_incoming = (
+                            finish_reason is None and len(response_contents[-1] + curr_content) > max_message_length
+                        )
+                        is_final_edit = finish_reason is not None or msg_split_incoming
+                        is_good_finish = finish_reason is not None and finish_reason.lower() in ("stop", "end_turn")
+
+                        if start_next_msg or ready_to_edit or is_final_edit:
+                            embed.description = (
+                                response_contents[-1]
+                                if is_final_edit
+                                else (response_contents[-1] + STREAMING_INDICATOR)
+                            )
+                            embed.color = (
+                                EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                            )
+
+                            if start_next_msg:
+                                await reply_helper(embed=embed, silent=True)
+                            else:
+                                await asyncio.sleep(max(0.0, EDIT_DELAY_SECONDS - time_delta))
+                                await response_msgs[-1].edit(embed=embed)
+
+                            last_task_time = datetime.now().timestamp()
+
+            if use_plain_responses:
+                for content in response_contents:
+                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
+
+    except Exception:
+        logging.exception("Error while generating response")
+    finally:
+        joined = "".join(response_contents)
+        for node in acquired_nodes:
+            node.text = joined
+            if node.lock.locked():
+                node.lock.release()
+
+    return response_msgs
+
+
 @dataclass(frozen=True)
 class Gate:
     """The policy verdict for one incoming message.
@@ -721,111 +828,22 @@ async def on_message(new_msg: discord.Message) -> None:
         now = datetime.now().astimezone()
         messages.append(dict(role="system", content=format_system_prompt(system_prompt, now)))
 
-    curr_content = finish_reason = None
-    response_msgs = []
-    response_contents = []
-    acquired_nodes: list[MsgNode] = []
-
-    openai_kwargs = dict(
+    chunks = _completion_chunks(
+        provider_backend=provider_backend,
+        provider_config=provider_config,
+        openai_client=openai_client,
+        openai_kwargs=dict(
+            model=model,
+            messages=messages[::-1],
+            stream=True,
+            extra_headers=extra_headers,
+            extra_query=extra_query,
+            extra_body=extra_body,
+        ),
+        user_text=new_msg.content,
         model=model,
-        messages=messages[::-1],
-        stream=True,
-        extra_headers=extra_headers,
-        extra_query=extra_query,
-        extra_body=extra_body,
     )
-
-    if use_plain_responses := config.get("use_plain_responses", False):
-        max_message_length = 4000
-    else:
-        max_message_length = 4096 - len(STREAMING_INDICATOR)
-        embed = discord.Embed.from_dict(
-            dict(fields=[dict(name=warning, value="", inline=False) for warning in sorted(user_warnings)])
-        )
-
-    async def reply_helper(**reply_kwargs) -> None:
-        reply_target = new_msg if not response_msgs else response_msgs[-1]
-        response_msg = await reply_target.reply(**reply_kwargs)
-        response_msgs.append(response_msg)
-
-        node = MsgNode(parent_msg=new_msg)
-        msg_nodes[response_msg.id] = node
-        await node.lock.acquire()
-        acquired_nodes.append(node)
-
-    try:
-        async with new_msg.channel.typing():
-            chunks = _completion_chunks(
-                provider_backend=provider_backend,
-                provider_config=provider_config,
-                openai_client=openai_client,
-                openai_kwargs=openai_kwargs,
-                user_text=new_msg.content,
-                model=model,
-            )
-            async for chunk_content, chunk_finish_reason in chunks:
-                if finish_reason is not None:
-                    break
-
-                finish_reason = chunk_finish_reason
-
-                prev_content = curr_content or ""
-                curr_content = chunk_content
-
-                new_content = prev_content if finish_reason is None else (prev_content + curr_content)
-
-                if response_contents == [] and new_content == "":
-                    continue
-
-                if (
-                    start_next_msg := response_contents == []
-                    or len(response_contents[-1] + new_content) > max_message_length
-                ):
-                    response_contents.append("")
-
-                response_contents[-1] += new_content
-
-                if not use_plain_responses:
-                    async with edit_lock:
-                        time_delta = datetime.now().timestamp() - last_task_time
-
-                        ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
-                        msg_split_incoming = (
-                            finish_reason is None and len(response_contents[-1] + curr_content) > max_message_length
-                        )
-                        is_final_edit = finish_reason is not None or msg_split_incoming
-                        is_good_finish = finish_reason is not None and finish_reason.lower() in ("stop", "end_turn")
-
-                        if start_next_msg or ready_to_edit or is_final_edit:
-                            embed.description = (
-                                response_contents[-1]
-                                if is_final_edit
-                                else (response_contents[-1] + STREAMING_INDICATOR)
-                            )
-                            embed.color = (
-                                EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
-                            )
-
-                            if start_next_msg:
-                                await reply_helper(embed=embed, silent=True)
-                            else:
-                                await asyncio.sleep(max(0.0, EDIT_DELAY_SECONDS - time_delta))
-                                await response_msgs[-1].edit(embed=embed)
-
-                            last_task_time = datetime.now().timestamp()
-
-            if use_plain_responses:
-                for content in response_contents:
-                    await reply_helper(view=LayoutView().add_item(TextDisplay(content=content)))
-
-    except Exception:
-        logging.exception("Error while generating response")
-    finally:
-        joined = "".join(response_contents)
-        for node in acquired_nodes:
-            node.text = joined
-            if node.lock.locked():
-                node.lock.release()
+    response_msgs = await _stream_reply(new_msg, chunks, user_warnings=user_warnings)
 
     if should_learn and learning_store is not None and state is not None and response_msgs:
         learning_store.open_pending(
