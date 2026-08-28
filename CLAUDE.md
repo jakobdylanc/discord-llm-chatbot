@@ -34,9 +34,16 @@ Ruff: line length 120, rules `E,F,I,UP,B`; `llmcord.py` is exempt from `E501` an
 Layered, one direction, no cycles. Only `main.py` and the tests import `llmcord`.
 
 - **`main.py`** argparse entrypoint. Calls `llmcord.configure()`, then `llmcord.main()`.
-- **`llmcord.py`** the entire Discord runtime: slash commands, event handlers,
-  reply-chain walking, streaming, module-level mutable globals (`config`, `curr_model`,
-  `learning_store`, `msg_nodes`).
+- **`llmcord.py`** bot wiring only: slash commands, event handlers, `configure`,
+  lifecycle. `on_message` is orchestration that calls into `pipeline`.
+- **`pipeline.py`** the message pipeline: `_gate`, `_build_conversation`,
+  `_apply_memory`, `_completion_chunks`, `_stream_reply`, `_reload_config`.
+- **`runtime.py`** shared mutable state. The `runtime` singleton holds everything that
+  gets rebound (`config`, `curr_model`, `learning_store`, the httpx clients); the
+  singleton itself is never rebound, which is what makes importing it safe.
+  `discord_bot`, `msg_nodes`, `edit_lock` and `MsgNode` sit beside it because they are
+  created once and mutated in place. **`pipeline` must never import `llmcord`** — that
+  is the cycle this layout exists to avoid.
 - **`settings.py`** YAML load, `_env` resolution, validation, permission evaluation.
   Imports `backends.validate_loopback_url` so config validation and runtime enforce the
   same loopback rule.
@@ -132,4 +139,11 @@ Guild key is `"dm"` for direct messages.
   Hold stdin open (`tail -f /dev/null | abi-mcp &`).
 - **`.gitignore` is a whitelist and the `Dockerfile` `COPY` is an explicit file list.**
   A new top-level module needs an entry in both or it is invisible to git and missing
-  from the image.
+  from the image. The whitelist already covers `*.py`; the Dockerfile does not.
+- **Never `from llmcord import <mutable name>`, and prefer `runtime.x` over rebinding.**
+  A rebound module-level name is captured at import time by a from-import, so the
+  importer serves the startup value forever while hot-reload appears to work. That is a
+  silent wrong answer, not a crash. Hold new mutable state on `Runtime`.
+- **Monkeypatch where a name is *looked up*, not where it was defined.** `_reload_config`
+  resolves `load_and_validate` from `pipeline`'s globals, so patching
+  `llmcord.load_and_validate` silently does nothing. The split caught exactly this.

@@ -18,6 +18,7 @@ import discord
 import pytest
 
 import llmcord
+import pipeline
 from brain import DQNAgent
 from encoder import encode_state
 from learning import Action, LearningStore, command_sync_mode, decide_action
@@ -236,7 +237,9 @@ def test_unparseable_config_drops_the_message_instead_of_serving_it(monkeypatch,
     def _broken(*_args, **_kwargs):
         raise OSError("config.yaml is gone")
 
-    monkeypatch.setattr(llmcord, "load_and_validate", _broken)
+    # Patched on `pipeline`, not `llmcord`: _reload_config resolves the name from its
+    # own module globals, so patching the importer would silently do nothing.
+    monkeypatch.setattr(pipeline, "load_and_validate", _broken)
     _run(_message(is_dm=True))
     assert reached == [], "a forced DM must still be dropped when the config is broken"
 

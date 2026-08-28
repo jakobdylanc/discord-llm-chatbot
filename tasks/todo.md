@@ -23,4 +23,5 @@
 
 - [x] Measure the coupling before splitting (found: `config` is rebound, so a naive split silently breaks hot-reload)
 - [x] Extract `_reload_config`; `_gate` now has zero global writes
-- [ ] Give rebound globals a holder so importers cannot snapshot them (blocks the module split)
+- [x] Give rebound globals a holder so importers cannot snapshot them (044b9c2)
+- [x] Split into runtime.py / pipeline.py / llmcord.py
