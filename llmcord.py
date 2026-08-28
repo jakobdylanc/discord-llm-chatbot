@@ -657,6 +657,25 @@ async def _stream_reply(
     return response_msgs
 
 
+async def _reload_config() -> bool:
+    """Re-read and validate config.yaml, keeping curr_model pointing at something real.
+
+    Runs per message so edits apply without a restart. Returns False when the file no
+    longer validates, in which case the caller must drop the message rather than serve
+    it with a half-applied config.
+    """
+    global config, curr_model
+
+    try:
+        config = await asyncio.to_thread(load_and_validate, config_filename)
+    except (OSError, ConfigError):
+        logging.exception("Failed to reload config.yaml")
+        return False
+    if curr_model not in config["models"]:
+        curr_model = default_model(config["models"])
+    return True
+
+
 @dataclass(frozen=True)
 class Gate:
     """The policy verdict for one incoming message.
@@ -677,30 +696,17 @@ STOP = Gate(proceed=False)
 async def _gate(new_msg: discord.Message) -> Gate:
     """Decide whether this message earns a reply, applying any non-reply policy action.
 
-    Returns STOP for every path that must not reach a provider: bot authors, a config
-    that no longer validates, denied permissions, and the ignore/stay/react verdicts.
-    Mentions and DMs are forced through and bypass cooldown and budget.
+    Returns STOP for every path that must not reach a provider: denied permissions and
+    the ignore/stay/react verdicts. Mentions and DMs are forced through and bypass
+    cooldown and budget.
+
+    Reads global runtime state but writes none of it, so it can move to its own module
+    once `config` stops being a rebound global. See _reload_config.
     """
-    global config, curr_model
-
-    if new_msg.author.bot:
-        return STOP
-
     store = learning_store
-    if store is not None and new_msg.reference is not None and new_msg.reference.message_id:
-        store.note_human_reply(str(new_msg.reference.message_id))
-
     is_dm = new_msg.channel.type == discord.ChannelType.private
     mentioned = bool(discord_bot.user and discord_bot.user in new_msg.mentions)
     forced = is_dm or mentioned
-
-    try:
-        config = await asyncio.to_thread(load_and_validate, config_filename)
-        if curr_model not in config["models"]:
-            curr_model = default_model(config["models"])
-    except (OSError, ConfigError):
-        logging.exception("Failed to reload config.yaml")
-        return STOP
 
     channel_ids = set(
         filter(
@@ -772,6 +778,17 @@ async def _gate(new_msg: discord.Message) -> Gate:
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
     global last_task_time
+
+    if new_msg.author.bot:
+        return
+
+    # Recorded before the config reload on purpose: a broken config must not stop the
+    # reward loop from noticing that a human replied.
+    if learning_store is not None and new_msg.reference is not None and new_msg.reference.message_id:
+        learning_store.note_human_reply(str(new_msg.reference.message_id))
+
+    if not await _reload_config():
+        return
 
     gate = await _gate(new_msg)
     if not gate.proceed:

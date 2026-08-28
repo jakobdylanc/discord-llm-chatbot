@@ -222,3 +222,25 @@ def test_stream_reply_releases_node_locks_when_the_provider_fails(monkeypatch, w
     sent = asyncio.run(llmcord._stream_reply(msg, _explode(), user_warnings=set()))
     assert sent == [], "nothing was flushed before the failure"
     assert all(not node.lock.locked() for node in llmcord.msg_nodes.values())
+
+
+def test_unparseable_config_drops_the_message_instead_of_serving_it(monkeypatch, wired) -> None:
+    """A config that no longer validates must not fall through to a half-applied one.
+
+    Found by mutation testing: neutering the reload bail-out failed nothing, because a
+    DM is forced and would otherwise sail past a broken config straight to the provider.
+    """
+    _store, reached = wired
+
+    def _broken(*_args, **_kwargs):
+        raise OSError("config.yaml is gone")
+
+    monkeypatch.setattr(llmcord, "load_and_validate", _broken)
+    _run(_message(is_dm=True))
+    assert reached == [], "a forced DM must still be dropped when the config is broken"
+
+
+def test_config_reload_keeps_curr_model_pointing_at_a_real_entry(monkeypatch, wired) -> None:
+    monkeypatch.setattr(llmcord, "curr_model", "deleted-provider/deleted-model")
+    assert asyncio.run(llmcord._reload_config()) is True
+    assert llmcord.curr_model in llmcord.config["models"]

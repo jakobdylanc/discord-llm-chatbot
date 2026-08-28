@@ -21,4 +21,6 @@
 
 ### Open
 
-- [ ] llmcord.py is 894 lines; consider splitting the module before the next feature
+- [x] Measure the coupling before splitting (found: `config` is rebound, so a naive split silently breaks hot-reload)
+- [x] Extract `_reload_config`; `_gate` now has zero global writes
+- [ ] Give rebound globals a holder so importers cannot snapshot them (blocks the module split)
