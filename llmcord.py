@@ -5,15 +5,14 @@ import logging
 import os
 from base64 import b64encode
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import discord
 from discord import app_commands
 from discord.app_commands import Choice
-from discord.ext import commands
 from discord.ui import LayoutView, TextDisplay
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -27,6 +26,7 @@ from backends import (
 )
 from encoder import encode_state
 from learning import Action, LearningStore, command_sync_mode, decide_action, emoji_score
+from runtime import MAX_MESSAGE_NODES, MsgNode, discord_bot, edit_lock, msg_nodes, runtime
 from settings import (
     ConfigError,
     coerce_bool,
@@ -51,41 +51,12 @@ EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 STREAMING_INDICATOR = " ⚪"
 EDIT_DELAY_SECONDS = 1
 
-MAX_MESSAGE_NODES = 500
 
 # The ABI router returns one bounded string; chunk it to the shape the stream loop wants.
 ABI_CHUNK_CHARS = 1_000
 
-config: dict[str, Any] = {}
-config_filename = "config.yaml"
-curr_model = ""
-last_task_time = 0.0
-edit_lock = asyncio.Lock()
-learning_store: LearningStore | None = None
-
-intents = discord.Intents.default()
-intents.message_content = True
-discord_bot = commands.Bot(intents=intents, command_prefix=None)
-httpx_client = None
-backend_httpx_client = None
 
 
-@dataclass
-class MsgNode:
-    role: Literal["user", "assistant"] = "assistant"
-
-    text: str | None = None
-    images: list[dict[str, Any]] = field(default_factory=list)
-
-    has_bad_attachments: bool = False
-    fetch_parent_failed: bool = False
-
-    parent_msg: discord.Message | None = None
-
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
-msg_nodes: dict[int, MsgNode] = {}
 
 
 def _data_dir(cfg: dict[str, Any]) -> Path:
@@ -94,7 +65,7 @@ def _data_dir(cfg: dict[str, Any]) -> Path:
 
 
 def _is_admin(user_id: int) -> bool:
-    admin_ids = config.get("permissions", {}).get("users", {}).get("admin_ids") or []
+    admin_ids = runtime.config.get("permissions", {}).get("users", {}).get("admin_ids") or []
     return user_id in admin_ids
 
 
@@ -112,7 +83,7 @@ def _memory_backend(cfg: dict[str, Any]) -> WdbxMemoryBackend | None:
     if not coerce_bool(memory.get("enabled", False), name="memory.enabled"):
         return None
     return WdbxMemoryBackend(
-        _backend_httpx_client(),
+        runtime.backend_http(),
         base_url=str(memory["base_url"]),
         token=memory.get("token"),
         limit=int(memory.get("limit", 5)),
@@ -124,47 +95,27 @@ def _memory_backend(cfg: dict[str, Any]) -> WdbxMemoryBackend | None:
 
 
 def configure(filename: str = "config.yaml", *, init_store: bool = True) -> dict[str, Any]:
-    global config, config_filename, curr_model, learning_store
     load_dotenv()
-    config = load_and_validate(filename)
-    config_filename = filename
-    if not curr_model or curr_model not in config["models"]:
-        curr_model = default_model(config["models"])
-    status = (config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128]
+    runtime.config = load_and_validate(filename)
+    runtime.config_filename = filename
+    if not runtime.curr_model or runtime.curr_model not in runtime.config["models"]:
+        runtime.curr_model = default_model(runtime.config["models"])
+    status = (runtime.config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128]
     discord_bot.activity = discord.CustomActivity(name=status)
     if init_store:
-        window = int((config.get("learning") or {}).get("reward_window_seconds") or 150)
-        learning_store = LearningStore(_data_dir(config), reward_window_seconds=window)
-    return config
-
-
-def _httpx_client():
-    global httpx_client
-    if httpx_client is None:
-        import httpx
-
-        httpx_client = httpx.AsyncClient()
-    return httpx_client
-
-
-def _backend_httpx_client():
-    global backend_httpx_client
-    if backend_httpx_client is None:
-        import httpx
-
-        backend_httpx_client = httpx.AsyncClient(trust_env=False)
-    return backend_httpx_client
+        window = int((runtime.config.get("learning") or {}).get("reward_window_seconds") or 150)
+        runtime.learning_store = LearningStore(_data_dir(runtime.config), reward_window_seconds=window)
+    return runtime.config
 
 
 @discord_bot.tree.command(name="model", description="View or switch the current model")
 async def model_command(interaction: discord.Interaction, model: str) -> None:
-    global curr_model
 
-    if model == curr_model:
-        output = f"Current model: `{curr_model}`"
+    if model == runtime.curr_model:
+        output = f"Current model: `{runtime.curr_model}`"
     else:
         if _is_admin(interaction.user.id):
-            curr_model = model
+            runtime.curr_model = model
             output = f"Model switched to: `{model}`"
             logging.info(output)
         else:
@@ -175,24 +126,23 @@ async def model_command(interaction: discord.Interaction, model: str) -> None:
 
 @model_command.autocomplete("model")
 async def model_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
-    global config, curr_model
 
     if curr_str == "":
         try:
-            config = await asyncio.to_thread(load_and_validate, config_filename)
-            if curr_model not in config["models"]:
-                curr_model = default_model(config["models"])
+            runtime.config = await asyncio.to_thread(load_and_validate, runtime.config_filename)
+            if runtime.curr_model not in runtime.config["models"]:
+                runtime.curr_model = default_model(runtime.config["models"])
         except (OSError, ConfigError):
             logging.exception("Failed to reload config for /model autocomplete")
 
-    models = config.get("models") or {}
+    models = runtime.config.get("models") or {}
     choices = (
-        [Choice(name=f"◉ {curr_model} (current)", value=curr_model)] if curr_str.lower() in curr_model.lower() else []
+        [Choice(name=f"◉ {runtime.curr_model} (current)", value=runtime.curr_model)] if curr_str.lower() in runtime.curr_model.lower() else []
     )
     choices += [
         Choice(name=f"○ {model}", value=model)
         for model in models
-        if model != curr_model and curr_str.lower() in model.lower()
+        if model != runtime.curr_model and curr_str.lower() in model.lower()
     ]
 
     return choices[:25]
@@ -215,18 +165,18 @@ async def _require_admin(interaction: discord.Interaction) -> bool:
     ]
 )
 async def learn_command(interaction: discord.Interaction, mode: str = "status") -> None:
-    if learning_store is None:
+    if runtime.learning_store is None:
         await interaction.response.send_message("Learning store is not initialized.", ephemeral=True)
         return
     guild_id = _guild_key(interaction)
     if mode != "status" and not await _require_admin(interaction):
         return
     if mode == "on":
-        learning_store.set_learning(guild_id, True)
+        runtime.learning_store.set_learning(guild_id, True)
     elif mode == "off":
-        learning_store.set_learning(guild_id, False)
-    enabled = learning_store.is_learning(guild_id)
-    status = learning_store.status(guild_id)
+        runtime.learning_store.set_learning(guild_id, False)
+    enabled = runtime.learning_store.is_learning(guild_id)
+    status = runtime.learning_store.status(guild_id)
     text = (
         f"learning: **{'on' if enabled else 'off'}** · replay {status['replay']} · "
         f"steps {status['steps']} · ε {status['epsilon']:.3f}"
@@ -247,17 +197,17 @@ async def learn_command(interaction: discord.Interaction, mode: str = "status") 
     ]
 )
 async def act_command(interaction: discord.Interaction, mode: str = "status") -> None:
-    if learning_store is None:
+    if runtime.learning_store is None:
         await interaction.response.send_message("Learning store is not initialized.", ephemeral=True)
         return
     guild_id = _guild_key(interaction)
     if mode != "status" and not await _require_admin(interaction):
         return
     if mode == "on":
-        learning_store.set_act(guild_id, True)
+        runtime.learning_store.set_act(guild_id, True)
     elif mode == "off":
-        learning_store.set_act(guild_id, False)
-    enabled = learning_store.is_act(guild_id)
+        runtime.learning_store.set_act(guild_id, False)
+    enabled = runtime.learning_store.is_act(guild_id)
     text = f"act: **{'on' if enabled else 'off'}** (unsolicited policy; mentions/DMs always reply)"
     if not interaction.response.is_done():
         await interaction.response.send_message(text, ephemeral=True)
@@ -269,10 +219,10 @@ async def act_command(interaction: discord.Interaction, mode: str = "status") ->
 async def brain_command(interaction: discord.Interaction) -> None:
     if not await _require_admin(interaction):
         return
-    if learning_store is None:
+    if runtime.learning_store is None:
         await interaction.response.send_message("Learning store is not initialized.", ephemeral=True)
         return
-    status = learning_store.status(_guild_key(interaction))
+    status = runtime.learning_store.status(_guild_key(interaction))
     hist = status["histogram"]
     text = (
         f"topology `{status['topology']}` · ε `{status['epsilon']:.3f}` · steps `{status['steps']}`\n"
@@ -286,12 +236,12 @@ async def brain_command(interaction: discord.Interaction) -> None:
 
 async def settle_loop() -> None:
     while True:
-        interval = float((config.get("learning") or {}).get("settle_every_seconds") or 5)
+        interval = float((runtime.config.get("learning") or {}).get("settle_every_seconds") or 5)
         await asyncio.sleep(interval)
-        if learning_store is None:
+        if runtime.learning_store is None:
             continue
         try:
-            learning_store.settle_due()
+            runtime.learning_store.settle_due()
         except Exception:
             logging.exception("Reward settle failed")
 
@@ -315,7 +265,7 @@ async def sync_app_commands() -> None:
 
 @discord_bot.event
 async def on_ready() -> None:
-    if client_id := config.get("client_id"):
+    if client_id := runtime.config.get("client_id"):
         logging.info(
             "\n\nBOT INVITE URL:\nhttps://discord.com/oauth2/authorize?client_id=%s&permissions=412317191168&scope=bot\n",
             client_id,
@@ -327,24 +277,24 @@ async def on_ready() -> None:
 
 @discord_bot.event
 async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
-    if learning_store is None:
+    if runtime.learning_store is None:
         return
     if discord_bot.user and payload.user_id == discord_bot.user.id:
         return
     emoji = str(payload.emoji)
-    learning_store.note_reaction(str(payload.message_id), emoji)
+    runtime.learning_store.note_reaction(str(payload.message_id), emoji)
     score = emoji_score(emoji)
     if score != 0:
         guild_id = str(payload.guild_id) if payload.guild_id else "dm"
-        learning_store.apply_reputation(guild_id, str(payload.user_id), target=1.0 if score > 0 else 0.0)
+        runtime.learning_store.apply_reputation(guild_id, str(payload.user_id), target=1.0 if score > 0 else 0.0)
 
 
 @discord_bot.event
 async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
-    if learning_store is None:
+    if runtime.learning_store is None:
         return
-    learning_store.note_deleted(str(payload.message_id))
-    learning_store.settle_due()
+    runtime.learning_store.note_deleted(str(payload.message_id))
+    runtime.learning_store.settle_due()
 
 
 
@@ -365,7 +315,7 @@ async def _completion_chunks(
     """
     if provider_backend == "abi-mcp":
         abi = AbiMcpBackend(
-            _backend_httpx_client(),
+            runtime.backend_http(),
             base_url=provider_config["base_url"],
             token=provider_config.get("token"),
             tool=provider_config.get("tool", "ai_run"),
@@ -407,7 +357,7 @@ async def _build_conversation(
                     if att.content_type and any(att.content_type.startswith(x) for x in ("text", "image"))
                 ]
 
-                attachment_responses = await asyncio.gather(*[_httpx_client().get(att.url) for att in good_attachments])
+                attachment_responses = await asyncio.gather(*[runtime.http().get(att.url) for att in good_attachments])
 
                 curr_node.role = "assistant" if curr_msg.author == discord_bot.user else "user"
 
@@ -521,7 +471,7 @@ async def _apply_memory(
 ) -> None:
     """Append recalled WDBX context to `messages` and persist explicit remember requests."""
     try:
-        memory_backend = _memory_backend(config)
+        memory_backend = _memory_backend(runtime.config)
     except Exception:
         logging.exception("WDBX memory configuration failed; continuing without durable memory")
         memory_backend = None
@@ -563,14 +513,13 @@ async def _stream_reply(
     written and released in the finally block, so a mid-stream failure still leaves the
     cache consistent and the partial text readable by a later reply-chain walk.
     """
-    global last_task_time
 
     curr_content = finish_reason = None
     response_msgs = []
     response_contents = []
     acquired_nodes: list[MsgNode] = []
 
-    if use_plain_responses := config.get("use_plain_responses", False):
+    if use_plain_responses := runtime.config.get("use_plain_responses", False):
         max_message_length = 4000
     else:
         max_message_length = 4096 - len(STREAMING_INDICATOR)
@@ -614,7 +563,7 @@ async def _stream_reply(
 
                 if not use_plain_responses:
                     async with edit_lock:
-                        time_delta = datetime.now().timestamp() - last_task_time
+                        time_delta = datetime.now().timestamp() - runtime.last_task_time
 
                         ready_to_edit = time_delta >= EDIT_DELAY_SECONDS
                         msg_split_incoming = (
@@ -639,7 +588,7 @@ async def _stream_reply(
                                 await asyncio.sleep(max(0.0, EDIT_DELAY_SECONDS - time_delta))
                                 await response_msgs[-1].edit(embed=embed)
 
-                            last_task_time = datetime.now().timestamp()
+                            runtime.last_task_time = datetime.now().timestamp()
 
             if use_plain_responses:
                 for content in response_contents:
@@ -664,15 +613,14 @@ async def _reload_config() -> bool:
     longer validates, in which case the caller must drop the message rather than serve
     it with a half-applied config.
     """
-    global config, curr_model
 
     try:
-        config = await asyncio.to_thread(load_and_validate, config_filename)
+        runtime.config = await asyncio.to_thread(load_and_validate, runtime.config_filename)
     except (OSError, ConfigError):
         logging.exception("Failed to reload config.yaml")
         return False
-    if curr_model not in config["models"]:
-        curr_model = default_model(config["models"])
+    if runtime.curr_model not in runtime.config["models"]:
+        runtime.curr_model = default_model(runtime.config["models"])
     return True
 
 
@@ -703,7 +651,7 @@ async def _gate(new_msg: discord.Message) -> Gate:
     Reads global runtime state but writes none of it, so it can move to its own module
     once `config` stops being a rebound global. See _reload_config.
     """
-    store = learning_store
+    store = runtime.learning_store
     is_dm = new_msg.channel.type == discord.ChannelType.private
     mentioned = bool(discord_bot.user and discord_bot.user in new_msg.mentions)
     forced = is_dm or mentioned
@@ -723,8 +671,8 @@ async def _gate(new_msg: discord.Message) -> Gate:
         role_ids={role.id for role in getattr(new_msg.author, "roles", ())},
         channel_ids=channel_ids,
         is_dm=is_dm,
-        allow_dms=config.get("allow_dms", True),
-        permissions=config["permissions"],
+        allow_dms=runtime.config.get("allow_dms", True),
+        permissions=runtime.config["permissions"],
     ):
         return STOP
 
@@ -764,7 +712,7 @@ async def _gate(new_msg: discord.Message) -> Gate:
     if decision.kind == "react":
         _spend()
         try:
-            await new_msg.add_reaction((config.get("learning") or {}).get("react_emoji") or "\N{THUMBS UP SIGN}")
+            await new_msg.add_reaction((runtime.config.get("learning") or {}).get("react_emoji") or "\N{THUMBS UP SIGN}")
         except discord.HTTPException:
             logging.exception("Failed to add reaction")
         if decision.learn:
@@ -777,15 +725,14 @@ async def _gate(new_msg: discord.Message) -> Gate:
 
 @discord_bot.event
 async def on_message(new_msg: discord.Message) -> None:
-    global last_task_time
 
     if new_msg.author.bot:
         return
 
     # Recorded before the config reload on purpose: a broken config must not stop the
     # reward loop from noticing that a human replied.
-    if learning_store is not None and new_msg.reference is not None and new_msg.reference.message_id:
-        learning_store.note_human_reply(str(new_msg.reference.message_id))
+    if runtime.learning_store is not None and new_msg.reference is not None and new_msg.reference.message_id:
+        runtime.learning_store.note_human_reply(str(new_msg.reference.message_id))
 
     if not await _reload_config():
         return
@@ -795,7 +742,7 @@ async def on_message(new_msg: discord.Message) -> None:
         return
     guild_id, state, should_learn = gate.guild_id, gate.state, gate.should_learn
 
-    provider_slash_model = curr_model
+    provider_slash_model = runtime.curr_model
     try:
         provider, model = split_provider_model(provider_slash_model)
     except ConfigError:
@@ -803,7 +750,7 @@ async def on_message(new_msg: discord.Message) -> None:
         return
 
     try:
-        provider_config = config["providers"][provider]
+        provider_config = runtime.config["providers"][provider]
     except KeyError:
         logging.error("Provider %r is not in config.yaml", provider)
         return
@@ -815,7 +762,7 @@ async def on_message(new_msg: discord.Message) -> None:
         api_key = provider_config.get("api_key") or "sk-no-key-required"
         openai_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    model_parameters = config["models"].get(provider_slash_model, None)
+    model_parameters = runtime.config["models"].get(provider_slash_model, None)
 
     extra_headers = provider_config.get("extra_headers")
     extra_query = provider_config.get("extra_query")
@@ -823,9 +770,9 @@ async def on_message(new_msg: discord.Message) -> None:
 
     accept_images = is_vision_model(provider_slash_model)
 
-    max_text = config.get("max_text", 100000)
-    max_images = config.get("max_images", 5) if accept_images else 0
-    max_messages = config.get("max_messages", 25)
+    max_text = runtime.config.get("max_text", 100000)
+    max_images = runtime.config.get("max_images", 5) if accept_images else 0
+    max_messages = runtime.config.get("max_messages", 25)
 
     messages, user_warnings = await _build_conversation(
         new_msg, max_text=max_text, max_images=max_images, max_messages=max_messages
@@ -841,7 +788,7 @@ async def on_message(new_msg: discord.Message) -> None:
 
     await _apply_memory(messages, new_msg, provider_backend=provider_backend)
 
-    if system_prompt := config.get("system_prompt"):
+    if system_prompt := runtime.config.get("system_prompt"):
         now = datetime.now().astimezone()
         messages.append(dict(role="system", content=format_system_prompt(system_prompt, now)))
 
@@ -862,8 +809,8 @@ async def on_message(new_msg: discord.Message) -> None:
     )
     response_msgs = await _stream_reply(new_msg, chunks, user_warnings=user_warnings)
 
-    if should_learn and learning_store is not None and state is not None and response_msgs:
-        learning_store.open_pending(
+    if should_learn and runtime.learning_store is not None and state is not None and response_msgs:
+        runtime.learning_store.open_pending(
             guild_id=guild_id,
             message_id=str(response_msgs[0].id),
             action=Action.REPLY,
@@ -877,23 +824,18 @@ async def on_message(new_msg: discord.Message) -> None:
 
 
 async def run_bot() -> None:
-    token = config.get("bot_token")
+    token = runtime.config.get("bot_token")
     if not token:
         raise ConfigError("bot_token is missing")
     try:
         await discord_bot.start(token)
     finally:
-        if learning_store is not None:
+        if runtime.learning_store is not None:
             try:
-                learning_store.save()
+                runtime.learning_store.save()
             except Exception:
                 logging.exception("Failed to persist brains")
-        client = httpx_client
-        if client is not None:
-            await client.aclose()
-        backend_client = backend_httpx_client
-        if backend_client is not None:
-            await backend_client.aclose()
+        await runtime.aclose()
         if not discord_bot.is_closed():
             await discord_bot.close()
 

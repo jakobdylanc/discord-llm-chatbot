@@ -52,10 +52,11 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
     monkeypatch.setenv("XAI_API_KEY", "xai-test")
     store = LearningStore(tmp_path)
-    monkeypatch.setattr(llmcord, "learning_store", store)
-    monkeypatch.setattr(llmcord, "config_filename", str(Path(__file__).resolve().parents[1] / "config.yaml"))
-    monkeypatch.setattr(llmcord, "config", llmcord.load_and_validate(llmcord.config_filename))
-    monkeypatch.setattr(llmcord, "curr_model", "x-ai/grok-4.6")
+    rt = llmcord.runtime
+    monkeypatch.setattr(rt, "learning_store", store)
+    monkeypatch.setattr(rt, "config_filename", str(Path(__file__).resolve().parents[1] / "config.yaml"))
+    monkeypatch.setattr(rt, "config", llmcord.load_and_validate(rt.config_filename))
+    monkeypatch.setattr(rt, "curr_model", "x-ai/grok-4.6")
 
     reached: list[str] = []
 
@@ -176,7 +177,7 @@ def _streamable(monkeypatch):
     msg = _message()
     msg.channel.typing = lambda: _FakeTyping()
     msg.reply = _FakeSent().reply
-    monkeypatch.setitem(llmcord.config, "use_plain_responses", True)
+    monkeypatch.setitem(llmcord.runtime.config, "use_plain_responses", True)
     return msg
 
 
@@ -241,6 +242,6 @@ def test_unparseable_config_drops_the_message_instead_of_serving_it(monkeypatch,
 
 
 def test_config_reload_keeps_curr_model_pointing_at_a_real_entry(monkeypatch, wired) -> None:
-    monkeypatch.setattr(llmcord, "curr_model", "deleted-provider/deleted-model")
+    monkeypatch.setattr(llmcord.runtime, "curr_model", "deleted-provider/deleted-model")
     assert asyncio.run(llmcord._reload_config()) is True
-    assert llmcord.curr_model in llmcord.config["models"]
+    assert llmcord.runtime.curr_model in llmcord.runtime.config["models"]
